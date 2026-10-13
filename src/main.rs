@@ -240,6 +240,16 @@ fn main() {
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
+    let copy_path_shortcut = ctx.input(|input| {
+        input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::C)
+    });
+    if copy_path_shortcut {
+        if let (Some(comparison), Some(index)) = (&viewer.comparison, viewer.selected) {
+            if let Some(file) = comparison.files.get(index) {
+                ctx.copy_text(file.path.to_string_lossy().into_owned());
+            }
+        }
+    }
     let zoom_shortcut = ctx.input(|input| {
         if !input.modifiers.ctrl {
             return None;
@@ -397,6 +407,10 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("− removed").color(RED));
             ui.label(egui::RichText::new("+ added").color(GREEN));
+            ui.separator();
+            if ui.small_button("Copy path (Ctrl+Shift+C)").clicked() {
+                ui.ctx().copy_text(file.path.to_string_lossy().into_owned());
+            }
             ui.separator();
             if ui.small_button("Copy old file").clicked() {
                 ui.ctx()
