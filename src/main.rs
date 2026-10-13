@@ -212,14 +212,21 @@ fn main() {
     App::new()
         .insert_non_send_resource(Viewer::start(options))
         .insert_resource(WinitSettings::desktop_app())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Differ".into(),
-                resolution: (1280, 800).into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(bevy::log::LogPlugin {
+                    filter: "off".into(),
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Differ".into(),
+                        resolution: (1280, 800).into(),
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_plugins(EguiPlugin::default())
         .add_systems(Startup, |mut commands: Commands| {
             commands.spawn(Camera2d);
