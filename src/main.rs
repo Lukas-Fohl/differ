@@ -109,6 +109,7 @@ struct Viewer {
     requested: std::collections::HashSet<usize>,
     split: bool,
     full: bool,
+    light_mode: bool,
     code_zoom: f32,
     scroll_offsets: HashMap<(usize, bool, bool), f32>,
     pending_scroll: Option<((usize, bool, bool), f32)>,
@@ -158,6 +159,7 @@ impl Viewer {
             requested: Default::default(),
             split: false,
             full: false,
+            light_mode: false,
             code_zoom: 1.0,
             scroll_offsets: HashMap::new(),
             pending_scroll: None,
@@ -256,7 +258,11 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             .map(|index| (index, viewer.split, viewer.full));
         adjust_code_zoom(&mut viewer, zoom_in, scroll_key);
     }
-    ctx.set_visuals(egui::Visuals::dark());
+    ctx.set_visuals(if viewer.light_mode {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    });
     if (viewer.comparison.is_none() && viewer.error.is_none())
         || viewer
             .selected
@@ -277,6 +283,19 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             ui.separator();
             ui.selectable_value(&mut viewer.full, false, "Changes");
             ui.selectable_value(&mut viewer.full, true, "Full file");
+            ui.separator();
+            let theme_label = if viewer.light_mode {
+                "☾ Dark"
+            } else {
+                "☀ Light"
+            };
+            if ui
+                .button(theme_label)
+                .on_hover_text("Switch between light and dark themes")
+                .clicked()
+            {
+                viewer.light_mode = !viewer.light_mode;
+            }
             ui.separator();
             if ui
                 .button("⟳ Reload")
@@ -560,23 +579,50 @@ fn cell(
         return;
     };
     let row = &diff.rows[index];
+    let dark_mode = ui.visuals().dark_mode;
     let (background, foreground, prefix) = match row.kind {
-        LineKind::Added => (egui::Color32::from_rgb(27, 57, 42), GREEN, "+"),
-        LineKind::Removed => (egui::Color32::from_rgb(65, 33, 39), RED, "−"),
+        LineKind::Added if dark_mode => (egui::Color32::from_rgb(27, 57, 42), GREEN, "+"),
+        LineKind::Added => (
+            egui::Color32::from_rgb(222, 247, 229),
+            egui::Color32::from_rgb(35, 105, 58),
+            "+",
+        ),
+        LineKind::Removed if dark_mode => (egui::Color32::from_rgb(65, 33, 39), RED, "−"),
+        LineKind::Removed => (
+            egui::Color32::from_rgb(252, 226, 228),
+            egui::Color32::from_rgb(155, 45, 55),
+            "−",
+        ),
         LineKind::Note => (
-            egui::Color32::from_rgb(37, 41, 50),
-            egui::Color32::from_gray(150),
+            if dark_mode {
+                egui::Color32::from_rgb(37, 41, 50)
+            } else {
+                egui::Color32::from_gray(232)
+            },
+            if dark_mode {
+                egui::Color32::from_gray(150)
+            } else {
+                egui::Color32::from_gray(90)
+            },
             " ",
         ),
         LineKind::Context => (
             egui::Color32::TRANSPARENT,
-            egui::Color32::from_gray(205),
+            if dark_mode {
+                egui::Color32::from_gray(205)
+            } else {
+                egui::Color32::from_gray(35)
+            },
             " ",
         ),
     };
     ui.painter().rect_filled(rect, 0.0, background);
     let font = egui::FontId::monospace(13.0 * zoom);
-    let color = egui::Color32::from_gray(130);
+    let color = if dark_mode {
+        egui::Color32::from_gray(130)
+    } else {
+        egui::Color32::from_gray(120)
+    };
     let gutter_width = (if inline { 120.0 } else { 70.0 }) * zoom;
     let center = rect.center().y;
     if inline {
