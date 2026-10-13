@@ -43,7 +43,7 @@ enum Event {
 
 enum Request {
     File(usize),
-    Reload,
+    Reload(std::path::PathBuf),
 }
 
 #[derive(Default)]
@@ -101,6 +101,9 @@ impl Tree {
 struct Viewer {
     events: mpsc::Receiver<Event>,
     requests: mpsc::Sender<Request>,
+    repo_input: String,
+    browser_open: bool,
+    browser_path: std::path::PathBuf,
     comparison: Option<Arc<Comparison>>,
     tree: Tree,
     error: Option<String>,
@@ -118,15 +121,18 @@ impl Viewer {
     fn start(options: cli::Options) -> Self {
         let (events_tx, events) = mpsc::channel();
         let (requests, requests_rx) = mpsc::channel();
+        let repo_input = project_path_for_input(&options.repo);
+        let browser_path = home_directory();
         thread::spawn(move || {
-            let comparison = git::compare(&options.repo, options.target.clone()).map(Arc::new);
+            let repo = options.repo;
+            let target = options.target;
+            let comparison = git::compare(&repo, target.clone()).map(Arc::new);
             let _ = events_tx.send(Event::Comparison(comparison.clone()));
             let mut comparison = comparison.ok();
             while let Ok(request) = requests_rx.recv() {
                 match request {
-                    Request::Reload => {
-                        let result =
-                            git::compare(&options.repo, options.target.clone()).map(Arc::new);
+                    Request::Reload(new_repo) => {
+                        let result = git::compare(&new_repo, target.clone()).map(Arc::new);
                         comparison = result.as_ref().ok().cloned();
                         if events_tx.send(Event::Comparison(result)).is_err() {
                             break;
@@ -151,6 +157,9 @@ impl Viewer {
         Self {
             events,
             requests,
+            repo_input,
+            browser_open: false,
+            browser_path,
             comparison: None,
             tree: Tree::default(),
             error: None,
@@ -237,6 +246,59 @@ fn main() {
         .run();
 }
 
+fn home_directory() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::path::MAIN_SEPARATOR.to_string()))
+}
+
+fn project_path_for_input(path: &std::path::Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let home = home_directory();
+    absolute
+        .strip_prefix(&home)
+        .unwrap_or(&absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn project_path_from_input(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        home_directory().join(path)
+    }
+}
+
+fn delete_text_before_cursor(text: &mut String, range: Option<egui::text::CCursorRange>) {
+    let char_count = text.chars().count();
+    let selected = range
+        .map(|range| range.as_sorted_char_range())
+        .unwrap_or(char_count..char_count);
+    let (start, end) = if selected.is_empty() {
+        if selected.start == 0 {
+            return;
+        }
+        (selected.start - 1, selected.start)
+    } else {
+        (selected.start, selected.end)
+    };
+    let byte_start = text
+        .char_indices()
+        .nth(start)
+        .map_or(text.len(), |(byte, _)| byte);
+    let byte_end = text
+        .char_indices()
+        .nth(end)
+        .map_or(text.len(), |(byte, _)| byte);
+    text.replace_range(byte_start..byte_end, "");
+}
+
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
@@ -315,7 +377,12 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 viewer.cache.clear();
                 viewer.requested.clear();
                 viewer.error = None;
-                let _ = viewer.requests.send(Request::Reload);
+                let repo = viewer
+                    .comparison
+                    .as_ref()
+                    .map(|comparison| comparison.repo.clone())
+                    .unwrap_or_else(|| std::path::PathBuf::from(&viewer.repo_input));
+                let _ = viewer.requests.send(Request::Reload(repo));
             }
             ui.separator();
             if ui
@@ -334,7 +401,49 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 adjust_code_zoom(&mut viewer, true, scroll_key);
             }
         });
-        if let Some(c) = &viewer.comparison {
+        ui.horizontal(|ui| {
+            ui.label("Project");
+            let path_before_edit = viewer.repo_input.clone();
+            let path_response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut viewer.repo_input)
+                        .id(egui::Id::new("project_path"))
+                        .desired_width(300.0)
+                        .hint_text("path relative to $HOME or absolute"),
+                )
+                .on_hover_text("Edit a path relative to $HOME or enter an absolute path");
+            if path_response.has_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Backspace))
+                && viewer.repo_input == path_before_edit
+            {
+                let range = egui::widgets::text_edit::TextEditState::load(ctx, path_response.id)
+                    .and_then(|state| state.cursor.char_range());
+                delete_text_before_cursor(&mut viewer.repo_input, range);
+            }
+            if ui.button("Browse…").clicked() {
+                viewer.browser_open = true;
+            }
+            let open_clicked = ui
+                .add_enabled(
+                    !viewer.repo_input.trim().is_empty(),
+                    egui::Button::new("Open"),
+                )
+                .on_hover_text("Open this repository")
+                .clicked();
+            let enter_pressed =
+                path_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if !viewer.repo_input.trim().is_empty() && (open_clicked || enter_pressed) {
+                let repo = project_path_from_input(std::path::Path::new(viewer.repo_input.trim()));
+                viewer.cache.clear();
+                viewer.requested.clear();
+                viewer.comparison = None;
+                viewer.tree = Tree::default();
+                viewer.selected = None;
+                viewer.error = None;
+                let _ = viewer.requests.send(Request::Reload(repo));
+            }
+        });
+        if let Some(c) = viewer.comparison.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(c.repo.to_string_lossy()).weak());
                 ui.separator();
@@ -343,6 +452,68 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         }
         ui.add_space(4.0);
     });
+    if viewer.browser_open {
+        let mut browser_open = viewer.browser_open;
+        let mut navigate_to = None;
+        let mut selected_folder = None;
+        egui::Window::new("Select project folder")
+            .open(&mut browser_open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("↑ Parent").clicked() {
+                        navigate_to = viewer
+                            .browser_path
+                            .parent()
+                            .map(std::path::Path::to_path_buf);
+                    }
+                    ui.label(viewer.browser_path.to_string_lossy());
+                });
+                ui.separator();
+                let mut directories = match std::fs::read_dir(&viewer.browser_path) {
+                    Ok(entries) => entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| {
+                            entry
+                                .file_type()
+                                .ok()
+                                .filter(|kind| kind.is_dir())
+                                .map(|_| (entry.file_name(), entry.path()))
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(error) => {
+                        ui.colored_label(RED, format!("Could not read folder: {error}"));
+                        Vec::new()
+                    }
+                };
+                directories.sort_by(|a, b| a.0.cmp(&b.0));
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (name, path) in directories {
+                            if ui
+                                .button(format!("📁 {}", name.to_string_lossy()))
+                                .clicked()
+                            {
+                                navigate_to = Some(path);
+                            }
+                        }
+                    });
+                ui.separator();
+                if ui.button("Use this folder").clicked() {
+                    selected_folder = Some(viewer.browser_path.clone());
+                }
+            });
+        viewer.browser_open = browser_open;
+        if let Some(path) = navigate_to {
+            viewer.browser_path = path;
+        }
+        if let Some(path) = selected_folder {
+            viewer.repo_input = project_path_for_input(&path);
+            viewer.browser_open = false;
+        }
+    }
     if let Some(c) = viewer.comparison.clone() {
         egui::SidePanel::left("files")
             .default_width(260.0)

@@ -24,11 +24,11 @@ The repository defaults to the current directory. Subdirectories within a reposi
 - **Branch:** checked-out `HEAD` → selected branch tip. Choosing the checked-out branch shows no changes.
 - **Commit:** first parent → selected commit. A root commit compares with an empty tree; a merge commit compares with its first parent.
 
-Revisions and unstaged changes are captured at startup. The app never checks out branches, stages files, or writes repository content. Restart to load updated revisions.
+Revisions and unstaged changes are loaded at startup. Use **Reload** to refresh the current repository, or enter another repository path in the **Project** field and choose **Open** to switch projects. The app never checks out branches, stages files, or writes repository content.
 
 ## Interface
 
-Select a changed file in the collapsible tree. Drag the sidebar divider to resize it.
+Select a changed file in the collapsible tree. Drag the sidebar divider to resize it. Edit the project path or browse for a folder (starting in `$HOME`) to open a different repository without restarting. Relative paths in the project field are resolved from `$HOME`.
 
 - **Inline / Side by side:** one combined diff or aligned old/new columns with shared scrolling.
 - **Changes / Full file:** three context lines around each change, or every line including removed content.
