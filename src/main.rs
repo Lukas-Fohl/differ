@@ -9,8 +9,10 @@ use differ::{
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 struct Prepared {
@@ -36,6 +38,7 @@ impl Prepared {
     }
 }
 
+#[derive(Clone)]
 struct History {
     branches: git::Branches,
     source: String,
@@ -43,7 +46,95 @@ struct History {
     has_more: bool,
 }
 
+type FileKey = (std::path::PathBuf, bool);
+
+fn file_key(file: &git::ChangedFile) -> FileKey {
+    (file.path.clone(), file.staged)
+}
+fn file_id(c: &Comparison, index: usize) -> egui::Id {
+    egui::Id::new((&c.repo, file_key(&c.files[index])))
+}
+fn find_file(c: &Comparison, key: &FileKey) -> Option<usize> {
+    c.files
+        .iter()
+        .position(|file| file_key(file) == *key)
+        .or_else(|| c.files.iter().position(|file| file.path == key.0))
+}
+fn read_history(
+    repo: &std::path::Path,
+    source: Option<String>,
+    limit: usize,
+) -> Result<History, String> {
+    let branches = git::branches(repo)?;
+    let source = source.unwrap_or_else(|| {
+        branches
+            .current
+            .as_ref()
+            .filter(|name| branches.local.contains(name))
+            .map(|name| format!("refs/heads/{name}"))
+            .unwrap_or_else(|| "HEAD".into())
+    });
+    let mut commits = git::commit_history(repo, &source, 0, limit + 1)?;
+    let has_more = commits.len() > limit;
+    commits.truncate(limit);
+    Ok(History {
+        branches,
+        source,
+        commits,
+        has_more,
+    })
+}
+
+struct RefreshRequest {
+    generation: u64,
+    comparison: Arc<Comparison>,
+    target: git::Target,
+    selected: Option<FileKey>,
+    source: Option<String>,
+    limit: usize,
+    refs: Option<Vec<u8>>,
+}
+struct RefreshResult {
+    comparison: Arc<Comparison>,
+    selected: Option<(usize, Arc<Prepared>)>,
+    refs: Vec<u8>,
+    history: Option<Result<History, String>>,
+    branches_on_history_error: Option<git::Branches>,
+}
+fn refresh(request: &RefreshRequest) -> Result<RefreshResult, String> {
+    let repo = &request.comparison.repo;
+    let refs = git::refs_snapshot(repo)?;
+    let history = (request.refs.as_ref() != Some(&refs))
+        .then(|| read_history(repo, request.source.clone(), request.limit));
+    let branches_on_history_error = if history.as_ref().is_some_and(Result::is_err) {
+        Some(git::branches(repo)?)
+    } else {
+        None
+    };
+    let comparison = if matches!(request.target, git::Target::Commit(_)) {
+        request.comparison.clone()
+    } else {
+        Arc::new(git::compare(repo, request.target.clone())?)
+    };
+    let selected = request
+        .selected
+        .as_ref()
+        .and_then(|key| find_file(&comparison, key))
+        .map(|index| {
+            git::load_file(&comparison, index).map(|diff| (index, Arc::new(Prepared::new(diff))))
+        })
+        .transpose()?;
+    Ok(RefreshResult {
+        comparison,
+        selected,
+        refs,
+        history,
+        branches_on_history_error,
+    })
+}
+
 enum Event {
+    Refreshed(u64, Option<FileKey>, Result<RefreshResult, String>),
     Staging(u64, git::ChangedFile, Result<(), String>),
     Comparison(u64, git::Target, Result<Arc<Comparison>, String>),
     History(u64, Result<History, String>),
@@ -51,8 +142,9 @@ enum Event {
 }
 
 enum Request {
+    Refresh(RefreshRequest),
     ToggleStaging(u64, std::path::PathBuf, Vec<git::ChangedFile>),
-    File(u64, usize),
+    File(u64, usize, Arc<Comparison>),
     Reload {
         generation: u64,
         repo: std::path::PathBuf,
@@ -110,6 +202,7 @@ impl Tree {
     ) {
         for (name, tree) in &self.directories {
             let response = egui::CollapsingHeader::new(name.to_string_lossy())
+                .id_salt((&c.repo, name))
                 .default_open(true)
                 .show(ui, |ui| tree.show(ui, c, selected, action, busy));
             if c.working_tree {
@@ -173,6 +266,13 @@ struct Viewer {
     history_error: Option<String>,
     history_limit: usize,
     loading: bool,
+    refresh_pending: bool,
+    refresh_error: Option<String>,
+    next_refresh: Instant,
+    was_focused: bool,
+    history_source: Option<String>,
+    refs: Option<Vec<u8>>,
+    latest_generation: Arc<AtomicU64>,
     comparison: Option<Arc<Comparison>>,
     tree: Tree,
     staged_tree: Tree,
@@ -187,19 +287,30 @@ struct Viewer {
     full: bool,
     light_mode: bool,
     code_zoom: f32,
-    scroll_offsets: HashMap<(usize, bool, bool), f32>,
-    pending_scroll: Option<((usize, bool, bool), f32)>,
+    scroll_offsets: HashMap<(egui::Id, bool, bool), f32>,
+    pending_scroll: Option<((egui::Id, bool, bool), f32)>,
 }
 impl Viewer {
     fn start(options: cli::Options) -> Self {
         let (events_tx, events) = mpsc::channel();
         let (requests, requests_rx) = mpsc::channel();
         let repo_input = project_path_for_input(&options.repo);
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = latest_generation.clone();
         thread::spawn(move || {
-            let mut comparison = None;
-            let mut active_generation = 0;
             while let Ok(request) = requests_rx.recv() {
                 match request {
+                    Request::Refresh(request) => {
+                        if worker_generation.load(Ordering::Relaxed) != request.generation {
+                            continue;
+                        }
+                        let result = refresh(&request);
+                        let _ = events_tx.send(Event::Refreshed(
+                            request.generation,
+                            request.selected,
+                            result,
+                        ));
+                    }
                     Request::ToggleStaging(generation, repo, files) => {
                         let result = git::toggle_staging_files(&repo, &files);
                         if let Some(file) = files.into_iter().next() {
@@ -214,26 +325,7 @@ impl Viewer {
                         limit,
                         select_tip,
                     } => {
-                        active_generation = generation;
-                        let history = git::branches(&repo).and_then(|branches| {
-                            let source = source.unwrap_or_else(|| {
-                                branches
-                                    .current
-                                    .as_ref()
-                                    .filter(|name| branches.local.contains(name))
-                                    .map(|name| format!("refs/heads/{name}"))
-                                    .unwrap_or_else(|| "HEAD".into())
-                            });
-                            let mut commits = git::commit_history(&repo, &source, 0, limit + 1)?;
-                            let has_more = commits.len() > limit;
-                            commits.truncate(limit);
-                            Ok(History {
-                                branches,
-                                source,
-                                commits,
-                                has_more,
-                            })
-                        });
+                        let history = read_history(&repo, source, limit);
                         if select_tip {
                             target = history
                                 .as_ref()
@@ -247,7 +339,6 @@ impl Viewer {
                         } else {
                             git::compare(&repo, target.clone()).map(Arc::new)
                         };
-                        comparison = result.as_ref().ok().cloned();
                         let _ = events_tx.send(Event::History(generation, history));
                         if events_tx
                             .send(Event::Comparison(generation, target, result))
@@ -256,14 +347,11 @@ impl Viewer {
                             break;
                         }
                     }
-                    Request::File(generation, index) => {
-                        if generation != active_generation {
+                    Request::File(generation, index, comparison) => {
+                        if worker_generation.load(Ordering::Relaxed) != generation {
                             continue;
                         }
-                        let result = comparison
-                            .as_ref()
-                            .ok_or_else(|| "Could not open comparison".to_owned())
-                            .and_then(|comparison| git::load_file(comparison, index))
+                        let result = git::load_file(&comparison, index)
                             .map(Prepared::new)
                             .map(Arc::new);
                         if events_tx
@@ -288,7 +376,7 @@ impl Viewer {
             generation: 0,
             repo: options.repo.clone(),
             target: options.target.clone(),
-            source,
+            source: source.clone(),
             limit: 100,
             select_tip: false,
         });
@@ -303,6 +391,13 @@ impl Viewer {
             history_error: None,
             history_limit: 100,
             loading: true,
+            refresh_pending: false,
+            refresh_error: None,
+            next_refresh: Instant::now(),
+            was_focused: false,
+            history_source: source,
+            refs: None,
+            latest_generation,
             comparison: None,
             tree: Tree::default(),
             staged_tree: Tree::default(),
@@ -323,6 +418,12 @@ impl Viewer {
     }
     fn reload(&mut self, source: Option<String>, select_tip: bool) {
         self.generation += 1;
+        self.latest_generation
+            .store(self.generation, Ordering::Relaxed);
+        self.refresh_pending = false;
+        self.refresh_error = None;
+        self.refs = None;
+        self.next_refresh = Instant::now() + Duration::from_secs(1);
         self.loading = true;
         self.comparison = None;
         self.tree = Tree::default();
@@ -347,7 +448,7 @@ impl Viewer {
     }
 
     fn toggle_staging(&mut self, indices: &[usize]) {
-        if self.staging_pending {
+        if self.staging_pending || self.refresh_error.is_some() {
             return;
         }
         let Some(comparison) = &self.comparison else {
@@ -374,6 +475,11 @@ impl Viewer {
                 files.swap(0, position);
             }
         }
+        self.generation += 1;
+        self.latest_generation
+            .store(self.generation, Ordering::Relaxed);
+        self.refresh_pending = false;
+        self.requested.clear();
         self.staging_error = None;
         match self.requests.send(Request::ToggleStaging(
             self.generation,
@@ -385,25 +491,155 @@ impl Viewer {
         }
     }
 
+    fn selected_key(&self) -> Option<FileKey> {
+        self.comparison
+            .as_ref()
+            .and_then(|c| self.selected.and_then(|i| c.files.get(i)))
+            .map(file_key)
+    }
+
+    fn schedule_refresh(&mut self, focused: bool, now: Instant) {
+        if focused && !self.was_focused {
+            self.next_refresh = now;
+        }
+        self.was_focused = focused;
+        if focused && now >= self.next_refresh {
+            self.start_refresh(now);
+        }
+    }
+
+    fn start_refresh(&mut self, now: Instant) {
+        if self.loading || self.staging_pending || self.refresh_pending {
+            return;
+        }
+        self.next_refresh = now + Duration::from_secs(1);
+        let Some(comparison) = self.comparison.clone() else {
+            return;
+        };
+        let request = RefreshRequest {
+            generation: self.generation,
+            comparison,
+            target: self.target.clone(),
+            selected: self.selected_key(),
+            source: self.history_source.clone(),
+            limit: self.history_limit,
+            refs: self.refs.clone(),
+        };
+        if self.requests.send(Request::Refresh(request)).is_ok() {
+            self.refresh_pending = true;
+        } else {
+            self.refresh_error = Some("Repository worker is unavailable".into());
+        }
+    }
+
+    fn accept_refresh(
+        &mut self,
+        generation: u64,
+        selected: Option<FileKey>,
+        result: Result<RefreshResult, String>,
+    ) {
+        if generation != self.generation {
+            return;
+        }
+        self.refresh_pending = false;
+        self.next_refresh = Instant::now() + Duration::from_secs(1);
+        if selected != self.selected_key() {
+            return;
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.refresh_error = Some(error);
+                return;
+            }
+        };
+        self.refresh_error = None;
+        if let Some(history) = result.history {
+            match history {
+                Ok(history) => {
+                    self.history = Some(history);
+                    self.history_error = None;
+                    self.refs = Some(result.refs);
+                }
+                Err(error) => {
+                    self.history_error = Some(error);
+                    self.refs = None;
+                    if let (Some(history), Some(branches)) =
+                        (&mut self.history, result.branches_on_history_error)
+                    {
+                        history.branches = branches;
+                        history.commits.clear();
+                        history.has_more = false;
+                    }
+                }
+            }
+        } else {
+            self.refs = Some(result.refs);
+        }
+        let c = result.comparison;
+        let changed = self.comparison.as_deref() != Some(c.as_ref());
+        if changed {
+            self.tree = Tree::new(&c, false);
+            self.staged_tree = Tree::new(&c, true);
+        }
+        let old_cache = self.selected.and_then(|i| self.cache.get(&i)).cloned();
+        self.generation += 1;
+        self.latest_generation
+            .store(self.generation, Ordering::Relaxed);
+        self.requested.clear();
+        if c.working_tree || changed {
+            self.cache.clear();
+        }
+        self.selected = result.selected.as_ref().map(|(index, _)| *index);
+        if let Some((index, prepared)) = result.selected {
+            let prepared = match old_cache {
+                Some(Ok(old)) if old.diff == prepared.diff => old,
+                _ => prepared,
+            };
+            self.cache.insert(index, Ok(prepared));
+            self.requested.insert(index);
+            let key = (file_id(&c, index), self.split, self.full);
+            // Follow the same path when external staging moves it between sections.
+            let offset = self.scroll_offsets.get(&key).copied().or_else(|| {
+                let old = self.comparison.as_ref()?;
+                let old_index = selected.as_ref().and_then(|key| find_file(old, key))?;
+                self.scroll_offsets
+                    .get(&(file_id(old, old_index), self.split, self.full))
+                    .copied()
+            });
+            if let Some(offset) = offset {
+                self.pending_scroll = Some((key, offset));
+            }
+        }
+        self.comparison = Some(c);
+    }
+
     fn poll(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             self.accept(event);
         }
         if let Some(index) = self.selected {
             if self.requested.insert(index) {
-                let _ = self.requests.send(Request::File(self.generation, index));
+                if let Some(c) = &self.comparison {
+                    let _ = self
+                        .requests
+                        .send(Request::File(self.generation, index, c.clone()));
+                }
             }
         }
     }
 
     fn accept(&mut self, event: Event) {
         match event {
+            Event::Refreshed(generation, selected, result) => {
+                self.accept_refresh(generation, selected, result)
+            }
             Event::Staging(generation, file, result) => {
                 self.staging_pending = false;
                 if generation == self.generation {
                     match result {
                         Ok(()) => {
-                            let source = self.history.as_ref().map(|h| h.source.clone());
+                            let source = self.history_source.clone();
                             self.reload(source, false);
                             self.follow_file = Some((file.path, !file.staged));
                         }
@@ -548,6 +784,11 @@ fn delete_text_before_cursor(text: &mut String, range: Option<egui::text::CCurso
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
+    let focused = ctx.input(|input| input.raw.focused);
+    viewer.schedule_refresh(focused, Instant::now());
+    if focused {
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
     let copy_path_shortcut = ctx.input(|input| {
         input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::C)
     });
@@ -571,9 +812,12 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         }
     });
     if let Some(zoom_in) = zoom_shortcut {
-        let scroll_key = viewer
-            .selected
-            .map(|index| (index, viewer.split, viewer.full));
+        let scroll_key = viewer.selected.and_then(|index| {
+            viewer
+                .comparison
+                .as_ref()
+                .map(|c| (file_id(c, index), viewer.split, viewer.full))
+        });
         adjust_code_zoom(&mut viewer, zoom_in, scroll_key);
     }
     ctx.set_visuals(if viewer.light_mode {
@@ -582,6 +826,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         egui::Visuals::dark()
     });
     if viewer.staging_pending
+        || viewer.refresh_pending
         || viewer.loading
         || (viewer.comparison.is_none() && viewer.error.is_none())
         || viewer
@@ -595,7 +840,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         ui.horizontal_wrapped(|ui| {
             let scroll_key = viewer
                 .selected
-                .map(|index| (index, viewer.split, viewer.full));
+                .and_then(|index| viewer.comparison.as_ref().map(|c| (file_id(c, index), viewer.split, viewer.full)));
             ui.strong("DIFF");
             ui.separator();
             ui.selectable_value(&mut viewer.split, false, "Inline");
@@ -622,8 +867,13 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 .on_hover_text("Reload changes from the repository")
                 .clicked()
             {
-                let source = viewer.history.as_ref().map(|h| h.source.clone());
-                viewer.reload(source, false);
+                if viewer.comparison.is_some() {
+                    viewer.refs = None;
+                    viewer.start_refresh(Instant::now());
+                } else {
+                    let source = viewer.history_source.clone();
+                    viewer.reload(source, false);
+                }
             }
             ui.separator();
             if ui
@@ -691,6 +941,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             if let Some(repo) = repo_to_open {
                 viewer.repo = repo;
                 viewer.target = git::Target::Worktree;
+                viewer.history_source = None;
                 viewer.history = None;
                 viewer.history_limit = 100;
                 viewer.reload(None, false);
@@ -742,18 +993,20 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                     });
             }
             if viewer.loading { ui.spinner(); ui.label("Loading…"); }
+            if let Some(error) = &viewer.refresh_error { ui.colored_label(RED, format!("Auto-refresh failed: {error}")); }
             if let Some(error) = &viewer.history_error { ui.colored_label(RED, error); }
         });
         if let Some(source) = branch_choice {
+            viewer.history_source = Some(source.clone());
             viewer.history_limit = 100;
             viewer.reload(Some(source), true);
         } else if let Some(target) = target_choice {
             viewer.target = target;
-            let source = viewer.history.as_ref().map(|h| h.source.clone());
+            let source = viewer.history_source.clone();
             viewer.reload(source, false);
         } else if load_more {
             viewer.history_limit += 100;
-            let source = viewer.history.as_ref().map(|h| h.source.clone());
+            let source = viewer.history_source.clone();
             viewer.reload(source, false);
         }
         if let Some(c) = viewer.comparison.clone() {
@@ -785,6 +1038,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                                     "{} · {count}",
                                     if staged { "Staged" } else { "Unstaged" }
                                 ))
+                                .id_salt(("staging_section", staged))
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     let tree = if staged {
@@ -797,7 +1051,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                                         &c,
                                         &mut selected,
                                         &mut action,
-                                        viewer.staging_pending,
+                                        viewer.staging_pending || viewer.refresh_error.is_some(),
                                     );
                                     if count == 0 {
                                         ui.weak("No files");
@@ -920,7 +1174,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             // Keep both columns visible; one horizontal scrollbar moves their code together.
             if content_width > width {
                 horizontal_offset = egui::ScrollArea::horizontal()
-                    .id_salt((index, "code-horizontal"))
+                    .id_salt((file_id(&c, index), "code-horizontal"))
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.allocate_space(egui::vec2(viewport_width + content_width - width, 2.0));
@@ -935,7 +1189,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         } else {
             egui::ScrollArea::both()
         };
-        let scroll_key = (index, split, full);
+        let scroll_key = (file_id(&c, index), split, full);
         let max_scroll = (rows.len() as f32 * row_height - ui.available_height()).max(0.0);
         let restore_offset = viewer
             .pending_scroll
@@ -1026,7 +1280,11 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     Ok(())
 }
 
-fn adjust_code_zoom(viewer: &mut Viewer, zoom_in: bool, scroll_key: Option<(usize, bool, bool)>) {
+fn adjust_code_zoom(
+    viewer: &mut Viewer,
+    zoom_in: bool,
+    scroll_key: Option<(egui::Id, bool, bool)>,
+) {
     let old_zoom = viewer.code_zoom;
     let new_zoom = if zoom_in {
         (old_zoom + 0.1).min(2.0)
@@ -1398,7 +1656,7 @@ mod selection_tests {
         assert!(viewer.staging_pending);
         assert!(matches!(
             received.try_recv(),
-            Ok(Request::ToggleStaging(0, _, _))
+            Ok(Request::ToggleStaging(1, _, _))
         ));
         assert!(received.try_recv().is_err());
         viewer.generation = 1;
@@ -1425,8 +1683,10 @@ mod selection_tests {
         });
         viewer.selected = Some(7);
         viewer.cache.insert(7, Err("old file".into()));
-        viewer.scroll_offsets.insert((7, false, false), 99.0);
-        viewer.pending_scroll = Some(((7, false, false), 99.0));
+        viewer
+            .scroll_offsets
+            .insert((egui::Id::new(7), false, false), 99.0);
+        viewer.pending_scroll = Some(((egui::Id::new(7), false, false), 99.0));
         viewer.reload(Some("refs/heads/main".into()), true);
         assert!(viewer.selected.is_none());
         assert!(viewer.cache.is_empty());
@@ -1450,5 +1710,261 @@ mod selection_tests {
         ));
         assert!(!viewer.loading);
         assert_eq!(viewer.error.as_deref(), Some("current error"));
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::{fs, path::PathBuf, process::Command};
+
+    struct Repo(PathBuf);
+    impl Repo {
+        fn new() -> Self {
+            let id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let repo = Self(
+                std::env::temp_dir().join(format!("differ-refresh-{}-{id}", std::process::id())),
+            );
+            fs::create_dir_all(&repo.0).unwrap();
+            repo.git(&["init", "-q"]);
+            repo.git(&["config", "user.email", "test@example.com"]);
+            repo.git(&["config", "user.name", "Test"]);
+            repo
+        }
+        fn git(&self, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().into()
+        }
+        fn write(&self, path: &str, text: &str) {
+            fs::write(self.0.join(path), text).unwrap();
+        }
+        fn commit(&self) {
+            self.git(&["add", "--all"]);
+            self.git(&["commit", "-qm", "test"]);
+        }
+        fn request(&self, selected: Option<FileKey>) -> RefreshRequest {
+            RefreshRequest {
+                generation: 0,
+                comparison: Arc::new(git::compare(&self.0, git::Target::Worktree).unwrap()),
+                target: git::Target::Worktree,
+                selected,
+                source: None,
+                limit: 100,
+                refs: None,
+            }
+        }
+    }
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn viewer(c: Arc<Comparison>) -> (Viewer, mpsc::Receiver<Request>) {
+        let mut viewer = Viewer::start(cli::Options {
+            repo: c.repo.clone(),
+            target: git::Target::Worktree,
+        });
+        let (tx, rx) = mpsc::channel();
+        viewer.requests = tx;
+        // Ignore initial worker messages: these tests drive events explicitly.
+        let (_tx, events) = mpsc::channel();
+        viewer.events = events;
+        viewer.loading = false;
+        viewer.comparison = Some(c);
+        viewer.selected = Some(0);
+        (viewer, rx)
+    }
+
+    #[test]
+    fn external_edits_refresh_even_when_status_does_not_change() {
+        let repo = Repo::new();
+        repo.write("file", "base\n");
+        repo.commit();
+        repo.write("file", "one\n");
+        let mut request = repo.request(Some(("file".into(), false)));
+        let first = refresh(&request).unwrap();
+        request.refs = Some(first.refs);
+        repo.write("file", "two\n");
+        repo.write(".gitignore", "ignored\n");
+        repo.write("ignored", "ignored");
+        repo.write("added", "new");
+        let second = refresh(&request).unwrap();
+        assert!(second.history.is_none());
+        assert!(
+            second
+                .selected
+                .as_ref()
+                .unwrap()
+                .1
+                .diff
+                .rows
+                .iter()
+                .any(|line| line.text == "two")
+        );
+        assert!(
+            !second
+                .comparison
+                .files
+                .iter()
+                .any(|file| file.path == PathBuf::from("ignored"))
+        );
+        assert!(
+            second
+                .comparison
+                .files
+                .iter()
+                .any(|file| file.path == PathBuf::from("added"))
+        );
+        repo.git(&["add", "file"]);
+        let staged = refresh(&request).unwrap();
+        assert!(staged.comparison.files[staged.selected.unwrap().0].staged);
+        repo.git(&["restore", "--staged", "file"]);
+        fs::remove_file(repo.0.join("file")).unwrap();
+        let deleted = refresh(&request).unwrap();
+        assert_eq!(
+            deleted.comparison.files[deleted.selected.unwrap().0].status,
+            "D"
+        );
+        repo.git(&["restore", "file"]);
+        assert!(refresh(&request).unwrap().selected.is_none());
+        repo.git(&["mv", "file", "renamed"]);
+        assert!(
+            refresh(&request)
+                .unwrap()
+                .comparison
+                .files
+                .iter()
+                .any(|f| f.path == PathBuf::from("renamed") && f.staged)
+        );
+    }
+
+    #[test]
+    fn refs_refresh_tracks_checkout_but_keeps_explicit_history_and_commits_fixed() {
+        let repo = Repo::new();
+        let empty = refresh(&repo.request(None)).unwrap();
+        assert!(empty.history.unwrap().unwrap().commits.is_empty());
+        repo.write("file", "base");
+        repo.commit();
+        let main = repo.git(&["symbolic-ref", "--short", "HEAD"]);
+        let id = repo.git(&["rev-parse", "HEAD"]);
+        let mut request = repo.request(None);
+        request.refs = Some(refresh(&request).unwrap().refs);
+        repo.git(&["checkout", "-qb", "other"]);
+        repo.write("file", "next");
+        repo.commit();
+        let next = refresh(&request).unwrap();
+        assert_eq!(next.history.unwrap().unwrap().source, "refs/heads/other");
+        request.source = Some(format!("refs/heads/{main}"));
+        assert_eq!(
+            refresh(&request).unwrap().history.unwrap().unwrap().commits[0].id,
+            id
+        );
+        request.target = git::Target::Commit(id.clone());
+        request.comparison = Arc::new(git::compare(&repo.0, request.target.clone()).unwrap());
+        request.selected = Some(("file".into(), false));
+        assert_eq!(refresh(&request).unwrap().comparison.new, id);
+        repo.git(&["branch", "-D", &main]);
+        let deleted = refresh(&request).unwrap();
+        assert!(deleted.history.unwrap().is_err());
+        assert_eq!(deleted.comparison.new, id);
+        request.source = None;
+        repo.git(&["checkout", "-q", "--detach"]);
+        assert!(
+            refresh(&request)
+                .unwrap()
+                .history
+                .unwrap()
+                .unwrap()
+                .branches
+                .current
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn focus_scheduler_is_single_flight_and_defers_to_staging() {
+        let repo = Repo::new();
+        let (mut viewer, requests) = viewer(repo.request(None).comparison);
+        viewer.selected = None;
+        let now = Instant::now();
+        viewer.schedule_refresh(false, now);
+        assert!(requests.try_recv().is_err());
+        viewer.schedule_refresh(true, now);
+        assert!(matches!(requests.try_recv(), Ok(Request::Refresh(_))));
+        viewer.schedule_refresh(true, now + Duration::from_secs(4));
+        assert!(requests.try_recv().is_err());
+        viewer.refresh_pending = false;
+        viewer.staging_pending = true;
+        viewer.schedule_refresh(true, now + Duration::from_secs(5));
+        assert!(requests.try_recv().is_err());
+        viewer.staging_pending = false;
+        viewer.schedule_refresh(false, now + Duration::from_secs(6));
+        viewer.next_refresh = now + Duration::from_secs(100);
+        viewer.schedule_refresh(true, now + Duration::from_secs(7));
+        assert!(matches!(requests.try_recv(), Ok(Request::Refresh(_))));
+    }
+
+    #[test]
+    fn refresh_preserves_selection_scroll_and_rejects_obsolete_results() {
+        let repo = Repo::new();
+        repo.write("file", "base");
+        repo.commit();
+        repo.write("file", "changed");
+        let request = repo.request(Some(("file".into(), false)));
+        let (mut viewer, requests) = viewer(request.comparison.clone());
+        let scroll_key = (file_id(&request.comparison, 0), false, false);
+        viewer.scroll_offsets.insert(scroll_key, 75.0);
+        repo.write("aaa", "new");
+        viewer.accept_refresh(0, request.selected.clone(), Ok(refresh(&request).unwrap()));
+        assert_eq!(viewer.selected_key(), request.selected);
+        assert_eq!(viewer.selected, Some(1));
+        assert_eq!(viewer.pending_scroll, Some((scroll_key, 75.0)));
+        let generation = viewer.generation;
+        viewer.accept_refresh(0, request.selected.clone(), Err("stale".into()));
+        assert!(viewer.refresh_error.is_none());
+        viewer.accept_refresh(
+            generation,
+            Some(("other".into(), false)),
+            Err("stale selection".into()),
+        );
+        assert!(viewer.refresh_error.is_none());
+        viewer.accept_refresh(
+            generation,
+            request.selected.clone(),
+            Err("unavailable".into()),
+        );
+        assert_eq!(viewer.refresh_error.as_deref(), Some("unavailable"));
+        assert!(viewer.comparison.is_some());
+        viewer.toggle_staging(&[1]);
+        assert!(requests.try_recv().is_err());
+        viewer.accept_refresh(
+            generation,
+            request.selected.clone(),
+            Ok(refresh(&request).unwrap()),
+        );
+        assert!(viewer.refresh_error.is_none());
+        repo.git(&["add", "file"]);
+        let generation = viewer.generation;
+        viewer.accept_refresh(
+            generation,
+            request.selected.clone(),
+            Ok(refresh(&request).unwrap()),
+        );
+        assert_eq!(viewer.selected_key(), Some(("file".into(), true)));
+        assert_eq!(viewer.pending_scroll.unwrap().1, 75.0);
     }
 }

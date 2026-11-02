@@ -24,7 +24,7 @@ The repository defaults to the current directory. Subdirectories within a reposi
 - **Branch:** checked-out `HEAD` → selected branch tip. Choosing the checked-out branch shows no changes.
 - **Commit:** first parent → selected commit. A root commit compares with an empty tree; a merge commit compares with its first parent.
 
-Revisions and working-tree changes are loaded at startup. Use **Reload** to refresh the current repository, or enter another repository path in the **Project** field and choose **Open** to switch projects. Double-clicking a file stages or unstages it. The app never checks out branches, commits, or discards working-tree content.
+Revisions and working-tree changes are loaded at startup. While the app is focused, changes refresh automatically about once a second and immediately when focus returns. The selected file and scroll position are preserved. Use **Reload** for an immediate refresh, or enter another repository path in the **Project** field and choose **Open** to switch projects. Double-clicking a file stages or unstages it. The app never checks out branches, commits, or discards working-tree content.
 
 ## Interface
 
@@ -32,7 +32,7 @@ Select a changed file in the collapsible tree. Working-tree files are grouped in
 
 - **Branch / Commit:** select a local branch to view its latest commit, or choose an older commit by hash and subject. Commits compare with their first parent; root commits compare with an empty tree. History includes merged commits, with **Load more…** after each 100 entries. Selection never checks out a branch or fetches.
 - **Working-tree changes (current checkout):** return to staged and unstaged changes regardless of the branch being browsed. Opening a new project starts here; selecting a folder opens it immediately.
-- **Reload:** refresh branches, history, and the selected comparison. Detached HEAD and repositories without commits are supported. CLI startup targets remain supported, including explicitly supplied remote refs.
+- **Auto-refresh / Reload:** refresh working-tree changes, branches, history, and branch comparisons while preserving the current view. Selected historical commits stay fixed. History follows external checkouts unless you explicitly choose a branch. Refresh failures keep the last view visible and temporarily disable staging until recovery. Detached HEAD and repositories without commits are supported. CLI startup targets remain supported, including explicitly supplied remote refs.
 - **Inline / Side by side:** one combined diff or aligned old/new columns with shared scrolling.
 - **Changes / Full file:** three context lines around each change, or every line including removed content.
 - Drag to select visible code text and use the system copy shortcut. **Copy old file / Copy new file** copies the complete side, without line numbers or diff markers.
@@ -55,8 +55,8 @@ rustc --edition=2024 --test src/lib.rs -o /tmp/differ-tests
 /tmp/differ-tests
 ```
 
-Manual desktop checks: open the default unstaged view, a changed branch, and a commit; select nested files; try all four layout/context combinations; resize the sidebar/window; scroll long files and long lines; select/copy text; check empty, invalid-revision, binary, rename, deleted-file, untracked-file, and symlink states.
+Manual desktop checks: edit files and stage/unstage externally while the app is focused; switch away and return; check selection and scroll preservation after file ordering changes. Open the default working-tree view, a changed branch, and a commit; select nested files; try all four layout/context combinations; resize the sidebar/window; scroll long files and long lines; select/copy text; check empty, invalid-revision, binary, rename, deleted-file, untracked-file, and symlink states.
 
 ## Current validation limits
 
-The implementation environment cannot resolve crates.io and has no cached Bevy/egui packages. Desktop compilation, runtime checks, and Cargo.lock generation therefore remain pending. Dependency versions are pinned in Cargo.toml; run `cargo check` with registry access to generate Cargo.lock, then retain it for reproducible builds.
+Compilation and automated tests run locally. Desktop interaction, including focus events and visual scroll preservation, still requires the manual checks above.

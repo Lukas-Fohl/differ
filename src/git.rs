@@ -2,21 +2,21 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Branch(String),
     Commit(String),
     Worktree,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitSummary {
     pub id: String,
     pub short_id: String,
     pub subject: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Branches {
     pub local: Vec<String>,
     pub current: Option<String>,
@@ -51,6 +51,26 @@ pub fn branches(repo: &Path) -> Result<Branches, String> {
             .success()
             .then(|| String::from_utf8_lossy(&current.stdout).trim().to_owned()),
     })
+}
+
+/// Ref identities used to avoid reloading unchanged history during polling.
+pub fn refs_snapshot(repo: &Path) -> Result<Vec<u8>, String> {
+    let mut refs = checked(
+        repo,
+        &[
+            arg("for-each-ref"),
+            arg("--sort=refname"),
+            arg("--format=%(refname) %(objectname)"),
+            arg("refs/heads/"),
+            arg("refs/remotes/"),
+        ],
+    )?;
+    refs.extend(checked(repo, &[arg("rev-parse"), arg("--git-dir")])?);
+    let head = git(repo, &[arg("rev-parse"), arg("--verify"), arg("HEAD")])?;
+    refs.extend(head.stdout);
+    let symbolic = git(repo, &[arg("symbolic-ref"), arg("--quiet"), arg("HEAD")])?;
+    refs.extend(symbolic.stdout);
+    Ok(refs)
 }
 
 pub fn commit_history(
@@ -103,7 +123,7 @@ pub fn commit_history(
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comparison {
     pub repo: PathBuf,
     pub old: String,
@@ -113,7 +133,7 @@ pub struct Comparison {
     pub files: Vec<ChangedFile>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangedFile {
     pub path: PathBuf,
     pub old_path: PathBuf,
@@ -122,13 +142,13 @@ pub struct ChangedFile {
     pub staged: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
     pub rows: Vec<DiffLine>,
     pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub old: Option<usize>,
     pub new: Option<usize>,
