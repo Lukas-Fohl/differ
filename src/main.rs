@@ -594,9 +594,12 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         });
         let split = viewer.split;
         let rows = &prepared.layouts[usize::from(split) + 2 * usize::from(viewer.full)];
-        let viewport_width = ui.available_width();
         let zoom = viewer.code_zoom;
         let row_height = CODE_ROW_HEIGHT * zoom;
+        let full = viewer.full;
+        let show_change_marks = full && rows.len() as f32 * row_height > ui.available_height();
+        let marks_width = if show_change_marks { 8.0 } else { 0.0 };
+        let viewport_width = (ui.available_width() - marks_width).max(1.0);
         let content_width = (prepared.width as f32 * 8.5 + 140.0) * zoom;
         let width = if split {
             ((viewport_width - 24.0) / 2.0).max(100.0)
@@ -627,7 +630,6 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         } else {
             egui::ScrollArea::both()
         };
-        let full = viewer.full;
         let scroll_key = (index, split, full);
         let max_scroll = (rows.len() as f32 * row_height - ui.available_height()).max(0.0);
         let restore_offset = viewer
@@ -637,65 +639,80 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         if restore_offset.is_some() {
             viewer.pending_scroll = None;
         }
-        let scroll = scroll.id_salt(scroll_key).auto_shrink([false, false]);
+        let scroll = scroll
+            .id_salt(scroll_key)
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(if show_change_marks {
+                egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+            } else {
+                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+            });
         let scroll = if let Some(offset) = restore_offset {
             scroll.vertical_scroll_offset(offset)
         } else {
             scroll
         };
-        let output = scroll.show_rows(ui, row_height, rows.len(), |ui, range| {
-            ui.set_min_width(if split { width * 2.0 + 12.0 } else { width });
-            for row_index in range {
-                let row = &rows[row_index];
-                ui.push_id(row_index, |ui| {
-                    if let Some(count) = row.gap {
-                        ui.add_sized(
-                            [width, row_height],
-                            egui::Label::new(
-                                egui::RichText::new(format!("··· {count} unchanged lines ···"))
-                                    .weak(),
-                            )
-                            .truncate(),
-                        );
-                    } else if split {
-                        let row_size = egui::vec2(width * 2.0 + 12.0, row_height);
-                        let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
-                        let left_rect =
-                            egui::Rect::from_min_size(row_rect.min, egui::vec2(width, row_height));
-                        let right_rect = egui::Rect::from_min_size(
-                            egui::pos2(row_rect.left() + width + 12.0, row_rect.top()),
-                            egui::vec2(width, row_height),
-                        );
-                        cell(
-                            ui,
-                            &prepared.diff,
-                            row.left,
-                            false,
-                            false,
-                            left_rect,
-                            horizontal_offset,
-                            zoom,
-                        );
-                        cell(
-                            ui,
-                            &prepared.diff,
-                            row.right,
-                            true,
-                            false,
-                            right_rect,
-                            horizontal_offset,
-                            zoom,
-                        );
-                    } else {
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(width, row_height),
-                            egui::Sense::hover(),
-                        );
-                        cell(ui, &prepared.diff, row.left, false, true, rect, 0.0, zoom);
-                    }
-                });
-            }
-        });
+        let output = if show_change_marks {
+            let viewport_height = ui.available_height();
+            ui.horizontal(|ui| {
+                let scroll_width = (ui.available_width() - marks_width).max(1.0);
+                let output = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(scroll_width, viewport_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |scroll_ui| {
+                            let original_style = scroll_ui.spacing().scroll;
+                            let mut overview_style = original_style;
+                            overview_style.floating = false;
+                            overview_style.dormant_background_opacity = 0.25;
+                            overview_style.dormant_handle_opacity = 0.65;
+                            scroll_ui.spacing_mut().scroll = overview_style;
+                            let output = scroll.show_rows(
+                                scroll_ui,
+                                row_height,
+                                rows.len(),
+                                |scroll_ui, range| {
+                                    render_code_rows(
+                                        scroll_ui,
+                                        range,
+                                        rows,
+                                        split,
+                                        width,
+                                        row_height,
+                                        &prepared,
+                                        horizontal_offset,
+                                        zoom,
+                                    );
+                                },
+                            );
+                            scroll_ui.spacing_mut().scroll = original_style;
+                            output
+                        },
+                    )
+                    .inner;
+                let (marks_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(marks_width, output.inner_rect.height()),
+                    egui::Sense::hover(),
+                );
+                paint_change_overview(ui, marks_rect, rows, &prepared.diff);
+                output
+            })
+            .inner
+        } else {
+            scroll.show_rows(ui, row_height, rows.len(), |scroll_ui, range| {
+                render_code_rows(
+                    scroll_ui,
+                    range,
+                    rows,
+                    split,
+                    width,
+                    row_height,
+                    &prepared,
+                    horizontal_offset,
+                    zoom,
+                );
+            })
+        };
         viewer
             .scroll_offsets
             .insert(scroll_key, output.state.offset.y);
@@ -729,6 +746,124 @@ fn adjust_code_zoom(viewer: &mut Viewer, zoom_in: bool, scroll_key: Option<(usiz
             ),
         )
     });
+}
+
+fn render_code_rows(
+    ui: &mut egui::Ui,
+    range: std::ops::Range<usize>,
+    rows: &[view::DisplayRow],
+    split: bool,
+    width: f32,
+    row_height: f32,
+    prepared: &Prepared,
+    horizontal_offset: f32,
+    zoom: f32,
+) {
+    ui.set_min_width(if split { width * 2.0 + 12.0 } else { width });
+    for row_index in range {
+        let row = &rows[row_index];
+        ui.push_id(row_index, |ui| {
+            if let Some(count) = row.gap {
+                ui.add_sized(
+                    [width, row_height],
+                    egui::Label::new(
+                        egui::RichText::new(format!("··· {count} unchanged lines ···")).weak(),
+                    )
+                    .truncate(),
+                );
+            } else if split {
+                let row_size = egui::vec2(width * 2.0 + 12.0, row_height);
+                let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+                let left_rect =
+                    egui::Rect::from_min_size(row_rect.min, egui::vec2(width, row_height));
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(row_rect.left() + width + 12.0, row_rect.top()),
+                    egui::vec2(width, row_height),
+                );
+                cell(
+                    ui,
+                    &prepared.diff,
+                    row.left,
+                    false,
+                    false,
+                    left_rect,
+                    horizontal_offset,
+                    zoom,
+                );
+                cell(
+                    ui,
+                    &prepared.diff,
+                    row.right,
+                    true,
+                    false,
+                    right_rect,
+                    horizontal_offset,
+                    zoom,
+                );
+            } else {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+                cell(ui, &prepared.diff, row.left, false, true, rect, 0.0, zoom);
+            }
+        });
+    }
+}
+
+fn paint_change_overview(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    rows: &[view::DisplayRow],
+    diff: &FileDiff,
+) {
+    if rows.is_empty() || rect.height() <= 0.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, ui.visuals().widgets.noninteractive.bg_fill);
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut removed = false;
+        let mut added = false;
+        for line_index in [row.left, row.right].into_iter().flatten() {
+            match diff.rows.get(line_index).map(|line| line.kind) {
+                Some(LineKind::Removed) => removed = true,
+                Some(LineKind::Added) => added = true,
+                _ => {}
+            }
+        }
+        if !removed && !added {
+            continue;
+        }
+        let y = rect.top() + ((row_index as f32 + 0.5) / rows.len() as f32) * rect.height();
+        let mark_height = 3.0_f32.min(rect.height());
+        if removed && added {
+            let half = rect.width() / 2.0;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), y - mark_height / 2.0),
+                    egui::vec2(half, mark_height),
+                ),
+                0.0,
+                RED,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + half, y - mark_height / 2.0),
+                    egui::vec2(rect.width() - half, mark_height),
+                ),
+                0.0,
+                GREEN,
+            );
+        } else {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), y - mark_height / 2.0),
+                    egui::vec2(rect.width(), mark_height),
+                ),
+                0.0,
+                if removed { RED } else { GREEN },
+            );
+        }
+    }
 }
 
 fn preserve_scroll_anchor(offset: f32, old_row_height: f32, new_row_height: f32) -> f32 {
