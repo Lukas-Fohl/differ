@@ -28,8 +28,11 @@ Revisions and unstaged changes are loaded at startup. Use **Reload** to refresh 
 
 ## Interface
 
-Select a changed file in the collapsible tree. Drag the sidebar divider to resize it. Edit the project path or browse for a folder (starting in `$HOME`) to open a different repository without restarting. Relative paths in the project field are resolved from `$HOME`.
+Select a changed file in the collapsible tree. Drag the sidebar divider to resize it. Edit the project path or browse with the native folder dialog (starting at the entered path) to open a different repository without restarting. Relative paths in the project field are resolved from `$HOME`.
 
+- **Branch / Commit:** select a local branch to view its latest commit, or choose an older commit by hash and subject. Commits compare with their first parent; root commits compare with an empty tree. History includes merged commits, with **Load more…** after each 100 entries. Selection never checks out a branch or fetches.
+- **Unstaged changes (current checkout):** return to unstaged changes regardless of the branch being browsed. Opening a new project starts here; selecting a folder opens it immediately.
+- **Reload:** refresh branches, history, and the selected comparison. Detached HEAD and repositories without commits are supported. CLI startup targets remain supported, including explicitly supplied remote refs.
 - **Inline / Side by side:** one combined diff or aligned old/new columns with shared scrolling.
 - **Changes / Full file:** three context lines around each change, or every line including removed content.
 - Drag to select visible code text and use the system copy shortcut. **Copy old file / Copy new file** copies the complete side, without line numbers or diff markers.

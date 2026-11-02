@@ -36,14 +36,29 @@ impl Prepared {
     }
 }
 
+struct History {
+    branches: git::Branches,
+    source: String,
+    commits: Vec<git::CommitSummary>,
+    has_more: bool,
+}
+
 enum Event {
-    Comparison(Result<Arc<Comparison>, String>),
-    File(usize, Result<Arc<Prepared>, String>),
+    Comparison(u64, git::Target, Result<Arc<Comparison>, String>),
+    History(u64, Result<History, String>),
+    File(u64, usize, Result<Arc<Prepared>, String>),
 }
 
 enum Request {
-    File(usize),
-    Reload(std::path::PathBuf),
+    File(u64, usize),
+    Reload {
+        generation: u64,
+        repo: std::path::PathBuf,
+        target: git::Target,
+        source: Option<String>,
+        limit: usize,
+        select_tip: bool,
+    },
 }
 
 #[derive(Default)]
@@ -102,6 +117,13 @@ struct Viewer {
     events: mpsc::Receiver<Event>,
     requests: mpsc::Sender<Request>,
     repo_input: String,
+    repo: std::path::PathBuf,
+    generation: u64,
+    target: git::Target,
+    history: Option<History>,
+    history_error: Option<String>,
+    history_limit: usize,
+    loading: bool,
     comparison: Option<Arc<Comparison>>,
     tree: Tree,
     error: Option<String>,
@@ -121,40 +143,107 @@ impl Viewer {
         let (requests, requests_rx) = mpsc::channel();
         let repo_input = project_path_for_input(&options.repo);
         thread::spawn(move || {
-            let repo = options.repo;
-            let target = options.target;
-            let comparison = git::compare(&repo, target.clone()).map(Arc::new);
-            let _ = events_tx.send(Event::Comparison(comparison.clone()));
-            let mut comparison = comparison.ok();
+            let mut comparison = None;
+            let mut active_generation = 0;
             while let Ok(request) = requests_rx.recv() {
                 match request {
-                    Request::Reload(new_repo) => {
-                        let result = git::compare(&new_repo, target.clone()).map(Arc::new);
+                    Request::Reload {
+                        generation,
+                        repo,
+                        mut target,
+                        source,
+                        limit,
+                        select_tip,
+                    } => {
+                        active_generation = generation;
+                        let history = git::branches(&repo).and_then(|branches| {
+                            let source = source.unwrap_or_else(|| {
+                                branches
+                                    .current
+                                    .as_ref()
+                                    .filter(|name| branches.local.contains(name))
+                                    .map(|name| format!("refs/heads/{name}"))
+                                    .unwrap_or_else(|| "HEAD".into())
+                            });
+                            let mut commits = git::commit_history(&repo, &source, 0, limit + 1)?;
+                            let has_more = commits.len() > limit;
+                            commits.truncate(limit);
+                            Ok(History {
+                                branches,
+                                source,
+                                commits,
+                                has_more,
+                            })
+                        });
+                        if select_tip {
+                            target = history
+                                .as_ref()
+                                .ok()
+                                .and_then(|h| h.commits.first())
+                                .map(|c| git::Target::Commit(c.id.clone()))
+                                .unwrap_or(git::Target::Worktree);
+                        }
+                        let result = if select_tip && history.is_err() {
+                            Err(history.as_ref().err().unwrap().clone())
+                        } else {
+                            git::compare(&repo, target.clone()).map(Arc::new)
+                        };
                         comparison = result.as_ref().ok().cloned();
-                        if events_tx.send(Event::Comparison(result)).is_err() {
+                        let _ = events_tx.send(Event::History(generation, history));
+                        if events_tx
+                            .send(Event::Comparison(generation, target, result))
+                            .is_err()
+                        {
                             break;
                         }
                     }
-                    Request::File(index) => {
+                    Request::File(generation, index) => {
+                        if generation != active_generation {
+                            continue;
+                        }
                         let result = comparison
                             .as_ref()
                             .ok_or_else(|| "Could not open comparison".to_owned())
-                            .and_then(|comparison| {
-                                git::load_file(comparison, index).map_err(|e| e.to_string())
-                            })
+                            .and_then(|comparison| git::load_file(comparison, index))
                             .map(Prepared::new)
                             .map(Arc::new);
-                        if events_tx.send(Event::File(index, result)).is_err() {
+                        if events_tx
+                            .send(Event::File(generation, index, result))
+                            .is_err()
+                        {
                             break;
                         }
                     }
                 }
             }
         });
+        let source = match &options.target {
+            git::Target::Branch(name) => Some(if name.starts_with("refs/") {
+                name.clone()
+            } else {
+                format!("refs/heads/{name}")
+            }),
+            _ => None,
+        };
+        let _ = requests.send(Request::Reload {
+            generation: 0,
+            repo: options.repo.clone(),
+            target: options.target.clone(),
+            source,
+            limit: 100,
+            select_tip: false,
+        });
         Self {
             events,
             requests,
             repo_input,
+            repo: options.repo,
+            generation: 0,
+            target: options.target,
+            history: None,
+            history_error: None,
+            history_limit: 100,
+            loading: true,
             comparison: None,
             tree: Tree::default(),
             error: None,
@@ -169,31 +258,67 @@ impl Viewer {
             pending_scroll: None,
         }
     }
+    fn reload(&mut self, source: Option<String>, select_tip: bool) {
+        self.generation += 1;
+        self.loading = true;
+        self.comparison = None;
+        self.tree = Tree::default();
+        self.selected = None;
+        self.cache.clear();
+        self.requested.clear();
+        self.scroll_offsets.clear();
+        self.pending_scroll = None;
+        self.error = None;
+        self.history_error = None;
+        let _ = self.requests.send(Request::Reload {
+            generation: self.generation,
+            repo: self.repo.clone(),
+            target: self.target.clone(),
+            source,
+            limit: self.history_limit,
+            select_tip,
+        });
+    }
+
     fn poll(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            match event {
-                Event::Comparison(Ok(c)) => {
-                    self.tree = Tree::new(&c);
-                    self.selected = (!c.files.is_empty()).then_some(0);
-                    self.comparison = Some(c);
-                    self.cache.clear();
-                    self.requested.clear();
-                    self.error = None;
-                }
-                Event::Comparison(Err(error)) => {
-                    self.cache.clear();
-                    self.requested.clear();
-                    self.error = Some(error);
-                }
-                Event::File(index, result) => {
-                    self.cache.insert(index, result);
-                }
-            }
+            self.accept(event);
         }
         if let Some(index) = self.selected {
             if self.requested.insert(index) {
-                let _ = self.requests.send(Request::File(index));
+                let _ = self.requests.send(Request::File(self.generation, index));
             }
+        }
+    }
+
+    fn accept(&mut self, event: Event) {
+        match event {
+            Event::History(generation, result) if generation == self.generation => match result {
+                Ok(history) => self.history = Some(history),
+                Err(error) => {
+                    self.history = None;
+                    self.history_error = Some(error);
+                }
+            },
+            Event::Comparison(generation, target, result) if generation == self.generation => {
+                self.loading = false;
+                self.target = target;
+                match result {
+                    Ok(c) => {
+                        if matches!(self.target, git::Target::Commit(_)) {
+                            self.target = git::Target::Commit(c.new.clone());
+                        }
+                        self.tree = Tree::new(&c);
+                        self.selected = (!c.files.is_empty()).then_some(0);
+                        self.comparison = Some(c);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            Event::File(generation, index, result) if generation == self.generation => {
+                self.cache.insert(index, result);
+            }
+            _ => {}
         }
     }
 }
@@ -330,7 +455,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     } else {
         egui::Visuals::dark()
     });
-    if (viewer.comparison.is_none() && viewer.error.is_none())
+    if viewer.loading
+        || (viewer.comparison.is_none() && viewer.error.is_none())
         || viewer
             .selected
             .is_some_and(|i| !viewer.cache.contains_key(&i))
@@ -369,15 +495,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 .on_hover_text("Reload changes from the repository")
                 .clicked()
             {
-                viewer.cache.clear();
-                viewer.requested.clear();
-                viewer.error = None;
-                let repo = viewer
-                    .comparison
-                    .as_ref()
-                    .map(|comparison| comparison.repo.clone())
-                    .unwrap_or_else(|| std::path::PathBuf::from(&viewer.repo_input));
-                let _ = viewer.requests.send(Request::Reload(repo));
+                let source = viewer.history.as_ref().map(|h| h.source.clone());
+                viewer.reload(source, false);
             }
             ui.separator();
             if ui
@@ -443,15 +562,73 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 )
             });
             if let Some(repo) = repo_to_open {
-                viewer.cache.clear();
-                viewer.requested.clear();
-                viewer.comparison = None;
-                viewer.tree = Tree::default();
-                viewer.selected = None;
-                viewer.error = None;
-                let _ = viewer.requests.send(Request::Reload(repo));
+                viewer.repo = repo;
+                viewer.target = git::Target::Worktree;
+                viewer.history = None;
+                viewer.history_limit = 100;
+                viewer.reload(None, false);
             }
         });
+        let mut branch_choice = None;
+        let mut target_choice = None;
+        let mut load_more = false;
+        ui.horizontal_wrapped(|ui| {
+            if let Some(history) = &viewer.history {
+                ui.label("Branch");
+                let branch_label = history.source.strip_prefix("refs/heads/").unwrap_or(&history.source);
+                let branch_label = if history.source == "HEAD" {
+                    history.branches.current.as_deref().unwrap_or("Detached HEAD")
+                } else { branch_label };
+                egui::ComboBox::from_id_salt("branch_selector").selected_text(branch_label)
+                    .show_ui(ui, |ui| {
+                        for branch in &history.branches.local {
+                            let source = format!("refs/heads/{branch}");
+                            if ui.selectable_label(history.source == source, branch).clicked() {
+                                branch_choice = Some(source);
+                            }
+                        }
+                    });
+                ui.label("Commit");
+                let selected_label = match &viewer.target {
+                    git::Target::Worktree => "Unstaged changes (current checkout)".to_owned(),
+                    git::Target::Branch(name) => format!("HEAD → {name}"),
+                    git::Target::Commit(id) => history.commits.iter().find(|c| &c.id == id)
+                        .map(|c| format!("{} — {}", c.short_id, c.subject))
+                        .unwrap_or_else(|| format!("Commit {id}")),
+                };
+                egui::ComboBox::from_id_salt("commit_selector").width(350.0)
+                    .selected_text(selected_label).show_ui(ui, |ui| {
+                        if ui.selectable_label(matches!(viewer.target, git::Target::Worktree),
+                            "Unstaged changes (current checkout)").clicked() {
+                            target_choice = Some(git::Target::Worktree);
+                        }
+                        for commit in &history.commits {
+                            if ui.selectable_label(matches!(&viewer.target, git::Target::Commit(id) if id == &commit.id),
+                                format!("{} — {}", commit.short_id, commit.subject)).clicked() {
+                                target_choice = Some(git::Target::Commit(commit.id.clone()));
+                            }
+                        }
+                        if history.commits.is_empty() { ui.label("No commits yet"); }
+                        if history.has_more && ui.add_enabled(!viewer.loading, egui::Button::new("Load more…")).clicked() {
+                            load_more = true;
+                        }
+                    });
+            }
+            if viewer.loading { ui.spinner(); ui.label("Loading…"); }
+            if let Some(error) = &viewer.history_error { ui.colored_label(RED, error); }
+        });
+        if let Some(source) = branch_choice {
+            viewer.history_limit = 100;
+            viewer.reload(Some(source), true);
+        } else if let Some(target) = target_choice {
+            viewer.target = target;
+            let source = viewer.history.as_ref().map(|h| h.source.clone());
+            viewer.reload(source, false);
+        } else if load_more {
+            viewer.history_limit += 100;
+            let source = viewer.history.as_ref().map(|h| h.source.clone());
+            viewer.reload(source, false);
+        }
         if let Some(c) = viewer.comparison.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(c.repo.to_string_lossy()).weak());
@@ -972,5 +1149,45 @@ mod zoom_tests {
         assert_eq!(clamp_scroll_offset(500.0, 120.0), 120.0);
         assert_eq!(clamp_scroll_offset(-2.0, 120.0), 0.0);
         assert_eq!(clamp_scroll_offset(50.0, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn changing_selection_discards_all_stale_results_and_resets_view() {
+        let mut viewer = Viewer::start(cli::Options {
+            repo: std::path::PathBuf::from("/nonexistent-differ-test-repository"),
+            target: git::Target::Worktree,
+        });
+        viewer.selected = Some(7);
+        viewer.cache.insert(7, Err("old file".into()));
+        viewer.scroll_offsets.insert((7, false, false), 99.0);
+        viewer.pending_scroll = Some(((7, false, false), 99.0));
+        viewer.reload(Some("refs/heads/main".into()), true);
+        assert!(viewer.selected.is_none());
+        assert!(viewer.cache.is_empty());
+        assert!(viewer.scroll_offsets.is_empty());
+        assert!(viewer.pending_scroll.is_none());
+        viewer.accept(Event::Comparison(
+            0,
+            git::Target::Commit("old".into()),
+            Err("stale".into()),
+        ));
+        viewer.accept(Event::History(0, Err("stale history".into())));
+        viewer.accept(Event::File(0, 7, Err("stale file".into())));
+        assert!(viewer.loading);
+        assert!(viewer.error.is_none());
+        assert!(viewer.history_error.is_none());
+        assert!(viewer.cache.is_empty());
+        viewer.accept(Event::Comparison(
+            viewer.generation,
+            git::Target::Worktree,
+            Err("current error".into()),
+        ));
+        assert!(!viewer.loading);
+        assert_eq!(viewer.error.as_deref(), Some("current error"));
     }
 }

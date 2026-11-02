@@ -10,6 +10,100 @@ pub enum Target {
 }
 
 #[derive(Clone, Debug)]
+pub struct CommitSummary {
+    pub id: String,
+    pub short_id: String,
+    pub subject: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Branches {
+    pub local: Vec<String>,
+    pub current: Option<String>,
+}
+
+pub fn branches(repo: &Path) -> Result<Branches, String> {
+    let raw = checked(
+        repo,
+        &[
+            arg("for-each-ref"),
+            arg("--sort=refname"),
+            arg("--format=%(refname:short)"),
+            arg("refs/heads/"),
+        ],
+    )?;
+    let current = git(
+        repo,
+        &[
+            arg("symbolic-ref"),
+            arg("--quiet"),
+            arg("--short"),
+            arg("HEAD"),
+        ],
+    )?;
+    Ok(Branches {
+        local: String::from_utf8_lossy(&raw)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        current: current
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&current.stdout).trim().to_owned()),
+    })
+}
+
+pub fn commit_history(
+    repo: &Path,
+    source: &str,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<CommitSummary>, String> {
+    let tip = match resolve(repo, source) {
+        Ok(tip) => tip,
+        Err(error) => {
+            if source == "HEAD" {
+                let branches = branches(repo)?;
+                if branches
+                    .current
+                    .is_some_and(|name| !branches.local.contains(&name))
+                {
+                    return Ok(Vec::new());
+                }
+            }
+            return Err(error);
+        }
+    };
+    let raw = checked(
+        repo,
+        &[
+            arg("log"),
+            arg("--date-order"),
+            arg("--no-show-signature"),
+            arg("--format=%H%x00%h%x00%s"),
+            arg(&format!("--skip={skip}")),
+            arg(&format!("--max-count={limit}")),
+            arg(&tip),
+            arg("--"),
+        ],
+    )?;
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .map(|line| {
+            let parts: Vec<_> = line.splitn(3, '\0').collect();
+            if parts.len() != 3 {
+                return Err("Malformed commit history".into());
+            }
+            Ok(CommitSummary {
+                id: parts[0].into(),
+                short_id: parts[1].into(),
+                subject: parts[2].into(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
 pub struct Comparison {
     pub repo: PathBuf,
     pub old: String,
@@ -576,6 +670,52 @@ mod tests {
     }
 
     #[test]
+    fn history_lists_local_branches_and_pages_only_reachable_commits() {
+        let r = Repo::new();
+        fs::write(r.0.join("file"), "one").unwrap();
+        let first = r.commit("first subject");
+        let main = r.run(&["symbolic-ref", "--short", "HEAD"]);
+        r.run(&["checkout", "-qb", "side"]);
+        fs::write(r.0.join("side"), "side").unwrap();
+        let side = r.commit("side subject");
+        r.run(&["checkout", "-q", &main]);
+        fs::write(r.0.join("file"), "two").unwrap();
+        let second = r.commit("second subject");
+        let b = branches(&r.0).unwrap();
+        assert_eq!(b.current.as_deref(), Some(main.as_str()));
+        assert!(b.local.contains(&"side".into()));
+        let page = commit_history(&r.0, "HEAD", 0, 1).unwrap();
+        assert_eq!(page[0].id, second);
+        assert_eq!(page[0].subject, "second subject");
+        assert!(second.starts_with(&page[0].short_id));
+        assert_eq!(commit_history(&r.0, "HEAD", 1, 1).unwrap()[0].id, first);
+        assert!(commit_history(&r.0, "HEAD", 2, 1).unwrap().is_empty());
+        assert!(
+            !commit_history(&r.0, "HEAD", 0, 100)
+                .unwrap()
+                .iter()
+                .any(|c| c.id == side)
+        );
+        assert_eq!(
+            commit_history(&r.0, "refs/heads/side", 0, 1).unwrap()[0].id,
+            side
+        );
+        r.run(&["checkout", "-q", "--detach"]);
+        assert!(branches(&r.0).unwrap().current.is_none());
+        assert_eq!(commit_history(&r.0, "HEAD", 0, 1).unwrap()[0].id, second);
+        r.run(&["checkout", "-q", "--orphan", "empty"]);
+        assert!(commit_history(&r.0, "HEAD", 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_repository_history_and_invalid_source() {
+        let r = Repo::new();
+        assert!(branches(&r.0).unwrap().local.is_empty());
+        assert!(commit_history(&r.0, "HEAD", 0, 100).unwrap().is_empty());
+        assert!(commit_history(&r.0, "refs/heads/missing", 0, 100).is_err());
+    }
+
+    #[test]
     fn compares_branch_and_commit_with_nul_safe_rename_paths() {
         let r = Repo::new();
         fs::write(r.0.join("before name.txt"), "one\n").unwrap();
@@ -702,6 +842,9 @@ mod tests {
         r.run(&["checkout", "-q", &main_branch]);
         r.run(&["merge", "-q", "--no-ff", "side", "-m", "merge"]);
         let merge = r.run(&["rev-parse", "HEAD"]);
+        let history = commit_history(&r.0, "HEAD", 0, 100).unwrap();
+        assert_eq!(history[0].id, merge);
+        assert!(history.iter().any(|c| c.subject == "side change"));
         let comparison = compare(&r.0, Target::Commit(merge)).unwrap();
         assert_eq!(comparison.old, first_parent);
         assert!(
