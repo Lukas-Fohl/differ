@@ -102,8 +102,6 @@ struct Viewer {
     events: mpsc::Receiver<Event>,
     requests: mpsc::Sender<Request>,
     repo_input: String,
-    browser_open: bool,
-    browser_path: std::path::PathBuf,
     comparison: Option<Arc<Comparison>>,
     tree: Tree,
     error: Option<String>,
@@ -122,7 +120,6 @@ impl Viewer {
         let (events_tx, events) = mpsc::channel();
         let (requests, requests_rx) = mpsc::channel();
         let repo_input = project_path_for_input(&options.repo);
-        let browser_path = home_directory();
         thread::spawn(move || {
             let repo = options.repo;
             let target = options.target;
@@ -158,8 +155,6 @@ impl Viewer {
             events,
             requests,
             repo_input,
-            browser_open: false,
-            browser_path,
             comparison: None,
             tree: Tree::default(),
             error: None,
@@ -420,8 +415,18 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                     .and_then(|state| state.cursor.char_range());
                 delete_text_before_cursor(&mut viewer.repo_input, range);
             }
+            let mut selected_folder = None;
             if ui.button("Browse…").clicked() {
-                viewer.browser_open = true;
+                let directory =
+                    project_path_from_input(std::path::Path::new(viewer.repo_input.trim()));
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select project folder")
+                    .set_directory(directory)
+                    .pick_folder()
+                {
+                    viewer.repo_input = project_path_for_input(&path);
+                    selected_folder = Some(path);
+                }
             }
             let open_clicked = ui
                 .add_enabled(
@@ -432,8 +437,12 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 .clicked();
             let enter_pressed =
                 path_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if !viewer.repo_input.trim().is_empty() && (open_clicked || enter_pressed) {
-                let repo = project_path_from_input(std::path::Path::new(viewer.repo_input.trim()));
+            let repo_to_open = selected_folder.or_else(|| {
+                (!viewer.repo_input.trim().is_empty() && (open_clicked || enter_pressed)).then(
+                    || project_path_from_input(std::path::Path::new(viewer.repo_input.trim())),
+                )
+            });
+            if let Some(repo) = repo_to_open {
                 viewer.cache.clear();
                 viewer.requested.clear();
                 viewer.comparison = None;
@@ -452,68 +461,6 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         }
         ui.add_space(4.0);
     });
-    if viewer.browser_open {
-        let mut browser_open = viewer.browser_open;
-        let mut navigate_to = None;
-        let mut selected_folder = None;
-        egui::Window::new("Select project folder")
-            .open(&mut browser_open)
-            .resizable(true)
-            .default_width(460.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("↑ Parent").clicked() {
-                        navigate_to = viewer
-                            .browser_path
-                            .parent()
-                            .map(std::path::Path::to_path_buf);
-                    }
-                    ui.label(viewer.browser_path.to_string_lossy());
-                });
-                ui.separator();
-                let mut directories = match std::fs::read_dir(&viewer.browser_path) {
-                    Ok(entries) => entries
-                        .filter_map(Result::ok)
-                        .filter_map(|entry| {
-                            entry
-                                .file_type()
-                                .ok()
-                                .filter(|kind| kind.is_dir())
-                                .map(|_| (entry.file_name(), entry.path()))
-                        })
-                        .collect::<Vec<_>>(),
-                    Err(error) => {
-                        ui.colored_label(RED, format!("Could not read folder: {error}"));
-                        Vec::new()
-                    }
-                };
-                directories.sort_by(|a, b| a.0.cmp(&b.0));
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for (name, path) in directories {
-                            if ui
-                                .button(format!("📁 {}", name.to_string_lossy()))
-                                .clicked()
-                            {
-                                navigate_to = Some(path);
-                            }
-                        }
-                    });
-                ui.separator();
-                if ui.button("Use this folder").clicked() {
-                    selected_folder = Some(viewer.browser_path.clone());
-                }
-            });
-        viewer.browser_open = browser_open;
-        if let Some(path) = navigate_to {
-            viewer.browser_path = path;
-        }
-        if let Some(path) = selected_folder {
-            viewer.repo_input = project_path_for_input(&path);
-            viewer.browser_open = false;
-        }
-    }
     if let Some(c) = viewer.comparison.clone() {
         egui::SidePanel::left("files")
             .default_width(260.0)
