@@ -119,6 +119,7 @@ pub struct ChangedFile {
     pub old_path: PathBuf,
     pub status: String,
     pub untracked: bool,
+    pub staged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +236,7 @@ fn changed_files(
     repo: &Path,
     old: Option<&str>,
     new: Option<&str>,
+    staged: bool,
 ) -> Result<Vec<ChangedFile>, String> {
     let mut args = vec![
         arg("diff"),
@@ -243,6 +245,9 @@ fn changed_files(
         arg("--find-renames"),
     ];
     args.extend(diff_flags());
+    if staged {
+        args.push(arg("--cached"));
+    }
     if let (Some(old), Some(new)) = (old, new) {
         args.extend([arg(old), arg(new)]);
     }
@@ -267,6 +272,7 @@ fn changed_files(
                 old_path,
                 status,
                 untracked: false,
+                staged,
             });
         } else {
             if i >= fields.len() {
@@ -279,6 +285,7 @@ fn changed_files(
                 old_path: path,
                 status,
                 untracked: false,
+                staged,
             });
         }
     }
@@ -303,6 +310,7 @@ fn untracked_files(repo: &Path) -> Result<Vec<ChangedFile>, String> {
                 old_path: path,
                 status: "A".to_owned(),
                 untracked: true,
+                staged: false,
             }
         })
         .collect())
@@ -321,7 +329,7 @@ pub fn compare(repo: &Path, target: Target) -> Result<Comparison, String> {
             (
                 "INDEX".to_owned(),
                 "WORKTREE".to_owned(),
-                format!("Unstaged changes · {branch}"),
+                format!("Working-tree changes · {branch}"),
                 true,
             )
         }
@@ -364,12 +372,13 @@ pub fn compare(repo: &Path, target: Target) -> Result<Comparison, String> {
         }
     };
     let files = if working_tree {
-        let mut files = changed_files(&repo, None, None)?;
+        let mut files = changed_files(&repo, None, None, false)?;
         files.extend(untracked_files(&repo)?);
+        files.extend(changed_files(&repo, None, None, true)?);
         files.sort_by(|a, b| a.path.cmp(&b.path));
         files
     } else {
-        changed_files(&repo, Some(&old), Some(&new))?
+        changed_files(&repo, Some(&old), Some(&new), false)?
     };
     let label = if working_tree {
         label
@@ -394,6 +403,46 @@ fn literal_pathspec(path: &Path) -> OsString {
     let mut s = OsString::from(":(literal)");
     s.push(path.as_os_str());
     s
+}
+
+/// Change only the index entries represented by this file; never modify the worktree.
+pub fn toggle_staging(repo: &Path, file: &ChangedFile) -> Result<(), String> {
+    let mut paths = vec![literal_pathspec(&file.path)];
+    if file.old_path != file.path {
+        paths.push(literal_pathspec(&file.old_path));
+    }
+    let mut conflict_args = vec![arg("ls-files"), arg("--unmerged"), arg("-z"), arg("--")];
+    conflict_args.extend(paths.clone());
+    if !checked(repo, &conflict_args)?.is_empty() {
+        return Err("Resolve this file's merge conflicts before staging or unstaging it.".into());
+    }
+    let mut args = if file.staged {
+        let source = match resolve(repo, "HEAD") {
+            Ok(head) => head,
+            Err(error) => {
+                let b = branches(repo)?;
+                if !b.current.is_some_and(|name| !b.local.contains(&name)) {
+                    return Err(error);
+                }
+                String::from_utf8_lossy(&checked(
+                    repo,
+                    &[arg("hash-object"), arg("-t"), arg("tree"), arg("--stdin")],
+                )?)
+                .trim()
+                .to_owned()
+            }
+        };
+        vec![
+            arg("restore"),
+            arg("--staged"),
+            arg(&format!("--source={source}")),
+            arg("--"),
+        ]
+    } else {
+        vec![arg("add"), arg("--all"), arg("--")]
+    };
+    args.extend(paths);
+    checked(repo, &args).map(|_| ())
 }
 
 pub fn load_file(c: &Comparison, index: usize) -> Result<FileDiff, String> {
@@ -440,6 +489,9 @@ pub fn load_file(c: &Comparison, index: usize) -> Result<FileDiff, String> {
         arg("--full-index"),
         arg("--unified=2147483647"),
     ]);
+    if file.staged {
+        args.push(arg("--cached"));
+    }
     if !c.working_tree {
         args.extend([arg(&c.old), arg(&c.new)]);
     }
@@ -467,10 +519,14 @@ pub fn load_file(c: &Comparison, index: usize) -> Result<FileDiff, String> {
         && file.status != "D"
         && (file.status.starts_with('R') || mode_only)
     {
-        let mut spec = OsString::from(&c.new);
-        spec.push(":");
-        spec.push(file.path.as_os_str());
-        let content = checked(&c.repo, &[arg("show"), spec])?;
+        let content = if c.working_tree && !file.staged {
+            std::fs::read(c.repo.join(&file.path)).map_err(|e| e.to_string())?
+        } else {
+            let mut spec = OsString::from(if file.staged { "" } else { &c.new });
+            spec.push(":");
+            spec.push(file.path.as_os_str());
+            checked(&c.repo, &[arg("show"), spec])?
+        };
         if content.contains(&0) {
             diff.summary = Some("Binary file contents omitted".to_owned());
         } else {
@@ -765,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_default_includes_unstaged_tracked_and_untracked_changes() {
+    fn worktree_includes_separate_staged_unstaged_and_untracked_changes() {
         let r = Repo::new();
         fs::write(r.0.join("tracked.txt"), "committed\n").unwrap();
         fs::write(r.0.join(".gitignore"), "ignored.txt\n").unwrap();
@@ -778,11 +834,27 @@ mod tests {
 
         let comparison = compare(&r.0, Target::Worktree).unwrap();
         assert!(comparison.working_tree);
-        assert!(comparison.label.contains("Unstaged changes"));
-        assert_eq!(comparison.files.len(), 2);
+        assert!(comparison.label.contains("Working-tree changes"));
+        assert_eq!(comparison.files.len(), 3);
         assert_eq!(comparison.files[0].path, PathBuf::from("tracked.txt"));
-        assert_eq!(comparison.files[1].path, PathBuf::from("untracked.txt"));
-        assert!(comparison.files[1].untracked);
+        assert!(!comparison.files[0].staged);
+        assert!(comparison.files[1].staged);
+        let staged_diff = load_file(&comparison, 1).unwrap();
+        assert!(
+            staged_diff
+                .rows
+                .iter()
+                .any(|l| l.kind == LineKind::Removed && l.text == "committed")
+        );
+        assert!(
+            staged_diff
+                .rows
+                .iter()
+                .any(|l| l.kind == LineKind::Added && l.text == "staged")
+        );
+        assert!(!staged_diff.rows.iter().any(|l| l.text == "working"));
+        assert_eq!(comparison.files[2].path, PathBuf::from("untracked.txt"));
+        assert!(comparison.files[2].untracked);
         let diff = load_file(&comparison, 0).unwrap();
         assert!(
             diff.rows
@@ -796,12 +868,121 @@ mod tests {
         );
         assert!(!diff.rows.iter().any(|line| line.text == "committed"));
         assert!(!diff.rows.iter().any(|line| line.text == "new"));
-        let new_file = load_file(&comparison, 1).unwrap();
+        let new_file = load_file(&comparison, 2).unwrap();
         assert_eq!(new_file.rows.len(), 1);
         assert_eq!(new_file.rows[0].kind, LineKind::Added);
         assert_eq!(new_file.rows[0].text, "new");
         assert_eq!(new_file.rows[0].new, Some(1));
         assert_eq!(r.run(&["diff", "--cached", "--name-only"]), "tracked.txt");
+    }
+
+    fn entry(r: &Repo, path: &str, staged: bool) -> ChangedFile {
+        compare(&r.0, Target::Worktree)
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|f| f.path == PathBuf::from(path) && f.staged == staged)
+            .unwrap()
+    }
+
+    #[test]
+    fn stage_and_unstage_preserve_worktree_and_unrelated_index_entries() {
+        let r = Repo::new();
+        fs::write(r.0.join("file"), "base\n").unwrap();
+        fs::write(r.0.join("other"), "base\n").unwrap();
+        r.commit("base");
+        fs::write(r.0.join("file"), "partial\n").unwrap();
+        fs::write(r.0.join("other"), "unrelated\n").unwrap();
+        r.run(&["add", "file", "other"]);
+        fs::write(r.0.join("file"), "working\n").unwrap();
+        toggle_staging(&r.0, &entry(&r, "file", false)).unwrap();
+        assert_eq!(r.run(&["show", ":file"]), "working");
+        toggle_staging(&r.0, &entry(&r, "file", true)).unwrap();
+        assert_eq!(r.run(&["show", ":file"]), "base");
+        assert_eq!(fs::read_to_string(r.0.join("file")).unwrap(), "working\n");
+        assert_eq!(r.run(&["show", ":other"]), "unrelated");
+        fs::remove_file(r.0.join("file")).unwrap();
+        toggle_staging(&r.0, &entry(&r, "file", false)).unwrap();
+        assert_eq!(entry(&r, "file", true).status, "D");
+        toggle_staging(&r.0, &entry(&r, "file", true)).unwrap();
+        assert!(!r.0.join("file").exists());
+        assert_eq!(r.run(&["show", ":file"]), "base");
+    }
+
+    #[test]
+    fn stage_untracked_and_unstage_before_first_commit_with_literal_paths() {
+        let r = Repo::new();
+        let path = "-literal[*]: name\nfile";
+        fs::write(r.0.join(path), "new\n").unwrap();
+        fs::write(r.0.join("other"), "other\n").unwrap();
+        toggle_staging(&r.0, &entry(&r, path, false)).unwrap();
+        let c = compare(&r.0, Target::Worktree).unwrap();
+        let index = c.files.iter().position(|f| f.staged).unwrap();
+        assert!(
+            load_file(&c, index)
+                .unwrap()
+                .rows
+                .iter()
+                .any(|l| l.text == "new" && l.kind == LineKind::Added)
+        );
+        toggle_staging(&r.0, &entry(&r, path, true)).unwrap();
+        assert!(r.run(&["ls-files"]).is_empty());
+        assert_eq!(fs::read_to_string(r.0.join(path)).unwrap(), "new\n");
+        assert!(entry(&r, path, false).untracked);
+    }
+
+    #[test]
+    fn unstage_rename_restores_both_index_paths_and_can_restage() {
+        let r = Repo::new();
+        fs::write(r.0.join("before"), "same\n").unwrap();
+        r.commit("base");
+        r.run(&["mv", "before", "after"]);
+        let renamed = entry(&r, "after", true);
+        assert!(renamed.status.starts_with('R'));
+        toggle_staging(&r.0, &renamed).unwrap();
+        assert_eq!(r.run(&["ls-files"]), "before");
+        assert!(!r.0.join("before").exists());
+        assert_eq!(fs::read_to_string(r.0.join("after")).unwrap(), "same\n");
+        let mut unstaged_rename = renamed;
+        unstaged_rename.staged = false;
+        toggle_staging(&r.0, &unstaged_rename).unwrap();
+        assert_eq!(r.run(&["ls-files"]), "after");
+    }
+
+    #[test]
+    fn staging_failures_leave_index_untouched() {
+        let r = Repo::new();
+        fs::write(r.0.join("file"), "base\n").unwrap();
+        r.commit("base");
+        fs::write(r.0.join("file"), "changed\n").unwrap();
+        let file = entry(&r, "file", false);
+        fs::write(r.0.join(".git/index.lock"), "locked").unwrap();
+        assert!(toggle_staging(&r.0, &file).is_err());
+        assert_eq!(r.run(&["show", ":file"]), "base");
+    }
+
+    #[test]
+    fn unresolved_conflicts_cannot_be_toggled() {
+        let r = Repo::new();
+        fs::write(r.0.join("file"), "base\n").unwrap();
+        r.commit("base");
+        let main = r.run(&["symbolic-ref", "--short", "HEAD"]);
+        r.run(&["checkout", "-qb", "side"]);
+        fs::write(r.0.join("file"), "side\n").unwrap();
+        r.commit("side");
+        r.run(&["checkout", "-q", &main]);
+        fs::write(r.0.join("file"), "main\n").unwrap();
+        r.commit("main");
+        let output = git(&r.0, &[arg("merge"), arg("side")]).unwrap();
+        assert!(!output.status.success());
+        let before = r.run(&["ls-files", "--unmerged"]);
+        let file = entry(&r, "file", true);
+        assert!(
+            toggle_staging(&r.0, &file)
+                .unwrap_err()
+                .contains("conflicts")
+        );
+        assert_eq!(r.run(&["ls-files", "--unmerged"]), before);
     }
 
     #[cfg(unix)]

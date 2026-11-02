@@ -44,12 +44,14 @@ struct History {
 }
 
 enum Event {
+    Staging(u64, git::ChangedFile, Result<(), String>),
     Comparison(u64, git::Target, Result<Arc<Comparison>, String>),
     History(u64, Result<History, String>),
     File(u64, usize, Result<Arc<Prepared>, String>),
 }
 
 enum Request {
+    ToggleStaging(u64, std::path::PathBuf, git::ChangedFile),
     File(u64, usize),
     Reload {
         generation: u64,
@@ -67,9 +69,14 @@ struct Tree {
     files: Vec<(OsString, usize)>,
 }
 impl Tree {
-    fn new(c: &Comparison) -> Self {
+    fn new(c: &Comparison, staged: bool) -> Self {
         let mut root = Self::default();
-        for (index, file) in c.files.iter().enumerate() {
+        for (index, file) in c
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.staged == staged)
+        {
             let parts: Vec<_> = file
                 .path
                 .components()
@@ -85,11 +92,18 @@ impl Tree {
         }
         root
     }
-    fn show(&self, ui: &mut egui::Ui, c: &Comparison, selected: &mut Option<usize>) {
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        c: &Comparison,
+        selected: &mut Option<usize>,
+        action: &mut Option<usize>,
+        busy: bool,
+    ) {
         for (name, tree) in &self.directories {
             egui::CollapsingHeader::new(name.to_string_lossy())
                 .default_open(true)
-                .show(ui, |ui| tree.show(ui, c, selected));
+                .show(ui, |ui| tree.show(ui, c, selected, action, busy));
         }
         for (name, index) in &self.files {
             let file = &c.files[*index];
@@ -102,12 +116,24 @@ impl Tree {
             };
             let label =
                 egui::RichText::new(format!("{status}  {}", name.to_string_lossy())).color(color);
-            if ui
+            let response = ui
                 .selectable_label(*selected == Some(*index), label)
-                .on_hover_text(file.path.to_string_lossy())
-                .clicked()
-            {
+                .on_hover_text(file.path.to_string_lossy());
+            if response.clicked() {
                 *selected = Some(*index);
+            }
+            if c.working_tree {
+                let conflicted = file.status == "U";
+                let response = response.on_hover_text(if conflicted {
+                    "Resolve merge conflicts before staging or unstaging"
+                } else if file.staged {
+                    "Double-click to unstage this file"
+                } else {
+                    "Double-click to stage this entire file"
+                });
+                if response.double_clicked() && !busy && !conflicted {
+                    *action = Some(*index);
+                }
             }
         }
     }
@@ -126,6 +152,10 @@ struct Viewer {
     loading: bool,
     comparison: Option<Arc<Comparison>>,
     tree: Tree,
+    staged_tree: Tree,
+    staging_pending: bool,
+    staging_error: Option<String>,
+    follow_file: Option<(std::path::PathBuf, bool)>,
     error: Option<String>,
     selected: Option<usize>,
     cache: HashMap<usize, Result<Arc<Prepared>, String>>,
@@ -147,6 +177,10 @@ impl Viewer {
             let mut active_generation = 0;
             while let Ok(request) = requests_rx.recv() {
                 match request {
+                    Request::ToggleStaging(generation, repo, file) => {
+                        let result = git::toggle_staging(&repo, &file);
+                        let _ = events_tx.send(Event::Staging(generation, file, result));
+                    }
                     Request::Reload {
                         generation,
                         repo,
@@ -246,6 +280,10 @@ impl Viewer {
             loading: true,
             comparison: None,
             tree: Tree::default(),
+            staged_tree: Tree::default(),
+            staging_pending: false,
+            staging_error: None,
+            follow_file: None,
             error: None,
             selected: None,
             cache: HashMap::new(),
@@ -263,12 +301,15 @@ impl Viewer {
         self.loading = true;
         self.comparison = None;
         self.tree = Tree::default();
+        self.staged_tree = Tree::default();
+        self.follow_file = None;
         self.selected = None;
         self.cache.clear();
         self.requested.clear();
         self.scroll_offsets.clear();
         self.pending_scroll = None;
         self.error = None;
+        self.staging_error = None;
         self.history_error = None;
         let _ = self.requests.send(Request::Reload {
             generation: self.generation,
@@ -278,6 +319,33 @@ impl Viewer {
             limit: self.history_limit,
             select_tip,
         });
+    }
+
+    fn toggle_staging(&mut self, index: usize) {
+        if self.staging_pending {
+            return;
+        }
+        let Some(comparison) = &self.comparison else {
+            return;
+        };
+        if !comparison.working_tree {
+            return;
+        }
+        let Some(file) = comparison.files.get(index) else {
+            return;
+        };
+        if file.status == "U" {
+            return;
+        }
+        self.staging_error = None;
+        match self.requests.send(Request::ToggleStaging(
+            self.generation,
+            comparison.repo.clone(),
+            file.clone(),
+        )) {
+            Ok(()) => self.staging_pending = true,
+            Err(_) => self.staging_error = Some("Repository worker is unavailable".into()),
+        }
     }
 
     fn poll(&mut self) {
@@ -293,6 +361,19 @@ impl Viewer {
 
     fn accept(&mut self, event: Event) {
         match event {
+            Event::Staging(generation, file, result) => {
+                self.staging_pending = false;
+                if generation == self.generation {
+                    match result {
+                        Ok(()) => {
+                            let source = self.history.as_ref().map(|h| h.source.clone());
+                            self.reload(source, false);
+                            self.follow_file = Some((file.path, !file.staged));
+                        }
+                        Err(error) => self.staging_error = Some(error),
+                    }
+                }
+            }
             Event::History(generation, result) if generation == self.generation => match result {
                 Ok(history) => self.history = Some(history),
                 Err(error) => {
@@ -308,8 +389,16 @@ impl Viewer {
                         if matches!(self.target, git::Target::Commit(_)) {
                             self.target = git::Target::Commit(c.new.clone());
                         }
-                        self.tree = Tree::new(&c);
-                        self.selected = (!c.files.is_empty()).then_some(0);
+                        self.tree = Tree::new(&c, false);
+                        self.staged_tree = Tree::new(&c, true);
+                        self.selected = if let Some((path, staged)) = self.follow_file.take() {
+                            c.files
+                                .iter()
+                                .position(|f| f.path == path && f.staged == staged)
+                                .or_else(|| c.files.iter().position(|f| f.path == path))
+                        } else {
+                            (!c.files.is_empty()).then_some(0)
+                        };
                         self.comparison = Some(c);
                     }
                     Err(error) => self.error = Some(error),
@@ -455,7 +544,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     } else {
         egui::Visuals::dark()
     });
-    if viewer.loading
+    if viewer.staging_pending
+        || viewer.loading
         || (viewer.comparison.is_none() && viewer.error.is_none())
         || viewer
             .selected
@@ -590,7 +680,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                     });
                 ui.label("Commit");
                 let selected_label = match &viewer.target {
-                    git::Target::Worktree => "Unstaged changes (current checkout)".to_owned(),
+                    git::Target::Worktree => "Working-tree changes (current checkout)".to_owned(),
                     git::Target::Branch(name) => format!("HEAD → {name}"),
                     git::Target::Commit(id) => history.commits.iter().find(|c| &c.id == id)
                         .map(|c| format!("{} — {}", c.short_id, c.subject))
@@ -599,7 +689,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 egui::ComboBox::from_id_salt("commit_selector").width(350.0)
                     .selected_text(selected_label).show_ui(ui, |ui| {
                         if ui.selectable_label(matches!(viewer.target, git::Target::Worktree),
-                            "Unstaged changes (current checkout)").clicked() {
+                            "Working-tree changes (current checkout)").clicked() {
                             target_choice = Some(git::Target::Worktree);
                         }
                         for commit in &history.commits {
@@ -648,7 +738,50 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 ui.strong(format!("Changed files  ·  {}", c.files.len()));
                 ui.separator();
                 let mut selected = viewer.selected;
-                egui::ScrollArea::both().show(ui, |ui| viewer.tree.show(ui, &c, &mut selected));
+                let mut action = None;
+                egui::ScrollArea::both().show(ui, |ui| {
+                    if c.working_tree {
+                        for staged in [true, false] {
+                            let count = c.files.iter().filter(|f| f.staged == staged).count();
+                            ui.push_id(staged, |ui| {
+                                egui::CollapsingHeader::new(format!(
+                                    "{} · {count}",
+                                    if staged { "Staged" } else { "Unstaged" }
+                                ))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let tree = if staged {
+                                        &viewer.staged_tree
+                                    } else {
+                                        &viewer.tree
+                                    };
+                                    tree.show(
+                                        ui,
+                                        &c,
+                                        &mut selected,
+                                        &mut action,
+                                        viewer.staging_pending,
+                                    );
+                                    if count == 0 {
+                                        ui.weak("No files");
+                                    }
+                                });
+                            });
+                        }
+                    } else {
+                        viewer.tree.show(ui, &c, &mut selected, &mut action, true);
+                    }
+                });
+                if let Some(index) = action {
+                    viewer.toggle_staging(index);
+                }
+                if viewer.staging_pending {
+                    ui.spinner();
+                    ui.label("Updating staging area…");
+                }
+                if let Some(error) = &viewer.staging_error {
+                    ui.colored_label(RED, error);
+                }
                 if viewer.selected != selected {
                     ctx.request_repaint();
                 }
@@ -667,9 +800,13 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             return;
         };
         let Some(index) = viewer.selected else {
+            if !c.files.is_empty() {
+                ui.heading("Select a file");
+                return;
+            }
             ui.heading("No changes");
             ui.label(if c.working_tree {
-                "No unstaged tracked-file changes."
+                "No staged or unstaged changes."
             } else {
                 "These revisions have identical file trees."
             });
@@ -677,6 +814,13 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         };
         let file = &c.files[index];
         ui.heading(file.path.to_string_lossy());
+        if c.working_tree {
+            ui.weak(if file.staged {
+                "Staged · HEAD → index"
+            } else {
+                "Unstaged · index → working tree"
+            });
+        }
         if file.path != file.old_path {
             ui.label(format!("Renamed from {}", file.old_path.display()));
         }
@@ -1155,6 +1299,53 @@ mod zoom_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn staging_is_single_flight_and_stale_completion_does_not_reload() {
+        let mut viewer = Viewer::start(cli::Options {
+            repo: std::path::PathBuf::from("/nonexistent-differ-test-repository"),
+            target: git::Target::Worktree,
+        });
+        let (requests, received) = mpsc::channel();
+        viewer.requests = requests;
+        let file = git::ChangedFile {
+            path: "file".into(),
+            old_path: "file".into(),
+            status: "M".into(),
+            untracked: false,
+            staged: false,
+        };
+        viewer.comparison = Some(Arc::new(Comparison {
+            repo: "/nonexistent-differ-test-repository".into(),
+            old: "INDEX".into(),
+            new: "WORKTREE".into(),
+            label: "test".into(),
+            working_tree: true,
+            files: vec![file.clone()],
+        }));
+        viewer.toggle_staging(0);
+        viewer.toggle_staging(0);
+        assert!(viewer.staging_pending);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Request::ToggleStaging(0, _, _))
+        ));
+        assert!(received.try_recv().is_err());
+        viewer.generation = 1;
+        viewer.accept(Event::Staging(0, file.clone(), Ok(())));
+        assert!(!viewer.staging_pending);
+        assert_eq!(viewer.generation, 1);
+        assert!(received.try_recv().is_err());
+        viewer.accept(Event::Staging(1, file.clone(), Err("index locked".into())));
+        assert_eq!(viewer.staging_error.as_deref(), Some("index locked"));
+        assert!(viewer.comparison.is_some());
+        viewer.accept(Event::Staging(1, file, Ok(())));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Request::Reload { generation: 2, .. })
+        ));
+        assert_eq!(viewer.follow_file, Some(("file".into(), true)));
+    }
 
     #[test]
     fn changing_selection_discards_all_stale_results_and_resets_view() {

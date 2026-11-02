@@ -19,19 +19,19 @@ cargo run -- --commit abc123
 cargo run -- --help
 ```
 
-The repository defaults to the current directory. Subdirectories within a repository are accepted. With neither `--branch` nor `--commit`, the app shows unstaged tracked-file changes and untracked, non-ignored files in the current checkout. Staged changes and ignored files are excluded. `--branch` and `--commit` are mutually exclusive. Local branches use their short name; remote branches can use a full ref such as `refs/remotes/origin/feature`.
+The repository defaults to the current directory. Subdirectories within a repository are accepted. With neither `--branch` nor `--commit`, the app shows staged and unstaged changes and untracked, non-ignored files in the current checkout. Ignored files are excluded. `--branch` and `--commit` are mutually exclusive. Local branches use their short name; remote branches can use a full ref such as `refs/remotes/origin/feature`.
 
 - **Branch:** checked-out `HEAD` → selected branch tip. Choosing the checked-out branch shows no changes.
 - **Commit:** first parent → selected commit. A root commit compares with an empty tree; a merge commit compares with its first parent.
 
-Revisions and unstaged changes are loaded at startup. Use **Reload** to refresh the current repository, or enter another repository path in the **Project** field and choose **Open** to switch projects. The app never checks out branches, stages files, or writes repository content.
+Revisions and working-tree changes are loaded at startup. Use **Reload** to refresh the current repository, or enter another repository path in the **Project** field and choose **Open** to switch projects. Double-clicking a file stages or unstages it. The app never checks out branches, commits, or discards working-tree content.
 
 ## Interface
 
-Select a changed file in the collapsible tree. Drag the sidebar divider to resize it. Edit the project path or browse with the native folder dialog (starting at the entered path) to open a different repository without restarting. Relative paths in the project field are resolved from `$HOME`.
+Select a changed file in the collapsible tree. Working-tree files are grouped into **Staged** and **Unstaged** sections. Single-click previews that section’s diff; double-click stages the entire unstaged file or unstages a staged file while preserving its working-tree contents. Partially staged files appear in both sections. Conflicted files must be resolved before using these actions. Drag the sidebar divider to resize it. Edit the project path or browse with the native folder dialog (starting at the entered path) to open a different repository without restarting. Relative paths in the project field are resolved from `$HOME`.
 
 - **Branch / Commit:** select a local branch to view its latest commit, or choose an older commit by hash and subject. Commits compare with their first parent; root commits compare with an empty tree. History includes merged commits, with **Load more…** after each 100 entries. Selection never checks out a branch or fetches.
-- **Unstaged changes (current checkout):** return to unstaged changes regardless of the branch being browsed. Opening a new project starts here; selecting a folder opens it immediately.
+- **Working-tree changes (current checkout):** return to staged and unstaged changes regardless of the branch being browsed. Opening a new project starts here; selecting a folder opens it immediately.
 - **Reload:** refresh branches, history, and the selected comparison. Detached HEAD and repositories without commits are supported. CLI startup targets remain supported, including explicitly supplied remote refs.
 - **Inline / Side by side:** one combined diff or aligned old/new columns with shared scrolling.
 - **Changes / Full file:** three context lines around each change, or every line including removed content.

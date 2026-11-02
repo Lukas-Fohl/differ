@@ -1,7 +1,7 @@
 use crate::git::Target;
 use std::{ffi::OsString, path::PathBuf};
 
-pub const HELP: &str = "differ — read-only desktop Git diff viewer
+pub const HELP: &str = "differ — desktop Git diff viewer
 
 USAGE:
     differ [OPTIONS]
@@ -13,8 +13,8 @@ OPTIONS:
     -h, --help        Print this help
 
 DEFAULT VIEW:
-    With no --branch or --commit, show unstaged tracked changes and untracked,
-    non-ignored files in the current checkout. Staged changes are excluded.
+    With no --branch or --commit, show staged and unstaged changes plus
+    untracked, non-ignored files in the current checkout.
 
 REVISION DETAILS:
     --branch accepts a local branch name or a full ref such as
@@ -33,7 +33,8 @@ EXAMPLES:
     differ --commit HEAD
     differ --commit abc123
 
-The viewer does not check out branches or modify repository content.";
+Double-click a working-tree file to stage or unstage it. The viewer does not
+check out branches, commit, or discard working-tree content.";
 
 pub struct Options {
     pub repo: PathBuf,
