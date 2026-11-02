@@ -51,7 +51,7 @@ enum Event {
 }
 
 enum Request {
-    ToggleStaging(u64, std::path::PathBuf, git::ChangedFile),
+    ToggleStaging(u64, std::path::PathBuf, Vec<git::ChangedFile>),
     File(u64, usize),
     Reload {
         generation: u64,
@@ -92,18 +92,41 @@ impl Tree {
         }
         root
     }
+    fn file_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<_> = self.files.iter().map(|(_, index)| *index).collect();
+        for tree in self.directories.values() {
+            indices.extend(tree.file_indices());
+        }
+        indices
+    }
+
     fn show(
         &self,
         ui: &mut egui::Ui,
         c: &Comparison,
         selected: &mut Option<usize>,
-        action: &mut Option<usize>,
+        action: &mut Option<Vec<usize>>,
         busy: bool,
     ) {
         for (name, tree) in &self.directories {
-            egui::CollapsingHeader::new(name.to_string_lossy())
+            let response = egui::CollapsingHeader::new(name.to_string_lossy())
                 .default_open(true)
                 .show(ui, |ui| tree.show(ui, c, selected, action, busy));
+            if c.working_tree {
+                let indices = tree.file_indices();
+                let conflicted = indices.iter().any(|&i| c.files[i].status == "U");
+                let staged = indices.first().is_some_and(|&i| c.files[i].staged);
+                let header = response.header_response.on_hover_text(if conflicted {
+                    "Resolve merge conflicts in this directory before staging or unstaging"
+                } else if staged {
+                    "Double-click to unstage all changed files in this directory"
+                } else {
+                    "Double-click to stage all changed files in this directory"
+                });
+                if header.double_clicked() && !busy && !conflicted {
+                    *action = Some(indices);
+                }
+            }
         }
         for (name, index) in &self.files {
             let file = &c.files[*index];
@@ -132,7 +155,7 @@ impl Tree {
                     "Double-click to stage this entire file"
                 });
                 if response.double_clicked() && !busy && !conflicted {
-                    *action = Some(*index);
+                    *action = Some(vec![*index]);
                 }
             }
         }
@@ -177,9 +200,11 @@ impl Viewer {
             let mut active_generation = 0;
             while let Ok(request) = requests_rx.recv() {
                 match request {
-                    Request::ToggleStaging(generation, repo, file) => {
-                        let result = git::toggle_staging(&repo, &file);
-                        let _ = events_tx.send(Event::Staging(generation, file, result));
+                    Request::ToggleStaging(generation, repo, files) => {
+                        let result = git::toggle_staging_files(&repo, &files);
+                        if let Some(file) = files.into_iter().next() {
+                            let _ = events_tx.send(Event::Staging(generation, file, result));
+                        }
                     }
                     Request::Reload {
                         generation,
@@ -321,7 +346,7 @@ impl Viewer {
         });
     }
 
-    fn toggle_staging(&mut self, index: usize) {
+    fn toggle_staging(&mut self, indices: &[usize]) {
         if self.staging_pending {
             return;
         }
@@ -331,17 +356,29 @@ impl Viewer {
         if !comparison.working_tree {
             return;
         }
-        let Some(file) = comparison.files.get(index) else {
+        let Some(mut files) = indices
+            .iter()
+            .map(|&index| comparison.files.get(index).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
             return;
         };
-        if file.status == "U" {
+        if files.is_empty() || files.iter().any(|file| file.status == "U") {
             return;
+        }
+        if let Some(selected) = self.selected.and_then(|index| comparison.files.get(index)) {
+            if let Some(position) = files
+                .iter()
+                .position(|file| file.path == selected.path && file.staged == selected.staged)
+            {
+                files.swap(0, position);
+            }
         }
         self.staging_error = None;
         match self.requests.send(Request::ToggleStaging(
             self.generation,
             comparison.repo.clone(),
-            file.clone(),
+            files,
         )) {
             Ok(()) => self.staging_pending = true,
             Err(_) => self.staging_error = Some("Repository worker is unavailable".into()),
@@ -773,7 +810,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                     }
                 });
                 if let Some(index) = action {
-                    viewer.toggle_staging(index);
+                    viewer.toggle_staging(&index);
                 }
                 if viewer.staging_pending {
                     ui.spinner();
@@ -1301,6 +1338,39 @@ mod selection_tests {
     use super::*;
 
     #[test]
+    fn directory_indices_include_descendants_only() {
+        let tree = Tree {
+            files: vec![("root".into(), 0)],
+            directories: BTreeMap::from([
+                (
+                    "dir".into(),
+                    Tree {
+                        files: vec![("file".into(), 1)],
+                        directories: BTreeMap::from([(
+                            "nested".into(),
+                            Tree {
+                                files: vec![("deep".into(), 2)],
+                                directories: BTreeMap::new(),
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "other".into(),
+                    Tree {
+                        files: vec![("file".into(), 3)],
+                        directories: BTreeMap::new(),
+                    },
+                ),
+            ]),
+        };
+        assert_eq!(
+            tree.directories[std::ffi::OsStr::new("dir")].file_indices(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
     fn staging_is_single_flight_and_stale_completion_does_not_reload() {
         let mut viewer = Viewer::start(cli::Options {
             repo: std::path::PathBuf::from("/nonexistent-differ-test-repository"),
@@ -1323,8 +1393,8 @@ mod selection_tests {
             working_tree: true,
             files: vec![file.clone()],
         }));
-        viewer.toggle_staging(0);
-        viewer.toggle_staging(0);
+        viewer.toggle_staging(&[0]);
+        viewer.toggle_staging(&[0]);
         assert!(viewer.staging_pending);
         assert!(matches!(
             received.try_recv(),

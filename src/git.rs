@@ -407,16 +407,35 @@ fn literal_pathspec(path: &Path) -> OsString {
 
 /// Change only the index entries represented by this file; never modify the worktree.
 pub fn toggle_staging(repo: &Path, file: &ChangedFile) -> Result<(), String> {
-    let mut paths = vec![literal_pathspec(&file.path)];
-    if file.old_path != file.path {
-        paths.push(literal_pathspec(&file.old_path));
+    toggle_staging_files(repo, std::slice::from_ref(file))
+}
+
+/// Stage or unstage a group in one Git operation, including both paths of renames.
+pub fn toggle_staging_files(repo: &Path, files: &[ChangedFile]) -> Result<(), String> {
+    let Some(first) = files.first() else {
+        return Ok(());
+    };
+    if files.iter().any(|file| file.staged != first.staged) {
+        return Err("Choose files from a single staging section".into());
     }
+    let mut paths = Vec::new();
+    for file in files {
+        paths.push(literal_pathspec(&file.path));
+        if file.old_path != file.path {
+            paths.push(literal_pathspec(&file.old_path));
+        }
+    }
+    paths.sort();
+    paths.dedup();
     let mut conflict_args = vec![arg("ls-files"), arg("--unmerged"), arg("-z"), arg("--")];
     conflict_args.extend(paths.clone());
     if !checked(repo, &conflict_args)?.is_empty() {
-        return Err("Resolve this file's merge conflicts before staging or unstaging it.".into());
+        return Err(
+            "Resolve merge conflicts in the selected files before staging or unstaging them."
+                .into(),
+        );
     }
-    let mut args = if file.staged {
+    let mut args = if first.staged {
         let source = match resolve(repo, "HEAD") {
             Ok(head) => head,
             Err(error) => {
@@ -950,6 +969,50 @@ mod tests {
     }
 
     #[test]
+    fn directory_batch_handles_nested_files_renames_and_preserves_other_entries() {
+        let r = Repo::new();
+        fs::create_dir_all(r.0.join("dir/nested")).unwrap();
+        fs::write(r.0.join("dir/edit"), "base\n").unwrap();
+        fs::write(r.0.join("dir/nested/delete"), "deleted\n").unwrap();
+        fs::write(r.0.join("outside"), "base\n").unwrap();
+        fs::write(r.0.join("rename-source"), "rename\n").unwrap();
+        r.commit("base");
+        fs::write(r.0.join("dir/edit"), "edited\n").unwrap();
+        fs::remove_file(r.0.join("dir/nested/delete")).unwrap();
+        fs::write(r.0.join("dir/nested/new[*]"), "new\n").unwrap();
+        fs::write(r.0.join("outside"), "staged outside\n").unwrap();
+        r.run(&["add", "outside"]);
+        let files: Vec<_> = compare(&r.0, Target::Worktree)
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|f| !f.staged && f.path.starts_with("dir"))
+            .collect();
+        assert_eq!(files.len(), 3);
+        toggle_staging_files(&r.0, &files).unwrap();
+        assert_eq!(r.run(&["show", ":dir/edit"]), "edited");
+        assert_eq!(r.run(&["show", ":dir/nested/new[*]"]), "new");
+        r.run(&["mv", "rename-source", "dir/renamed"]);
+        let files: Vec<_> = compare(&r.0, Target::Worktree)
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|f| f.staged && f.path.starts_with("dir"))
+            .collect();
+        assert_eq!(files.len(), 4);
+        toggle_staging_files(&r.0, &files).unwrap();
+        assert_eq!(r.run(&["diff", "--cached", "--name-only"]), "outside");
+        assert_eq!(
+            fs::read_to_string(r.0.join("dir/edit")).unwrap(),
+            "edited\n"
+        );
+        assert!(!r.0.join("dir/nested/delete").exists());
+        assert!(r.0.join("dir/nested/new[*]").exists());
+        assert!(r.0.join("dir/renamed").exists());
+        assert!(!r.0.join("rename-source").exists());
+    }
+
+    #[test]
     fn staging_failures_leave_index_untouched() {
         let r = Repo::new();
         fs::write(r.0.join("file"), "base\n").unwrap();
@@ -983,6 +1046,11 @@ mod tests {
                 .contains("conflicts")
         );
         assert_eq!(r.run(&["ls-files", "--unmerged"]), before);
+        fs::write(r.0.join("clean"), "new\n").unwrap();
+        let mut conflict = file;
+        conflict.staged = false;
+        assert!(toggle_staging_files(&r.0, &[entry(&r, "clean", false), conflict]).is_err());
+        assert!(r.run(&["ls-files", "clean"]).is_empty());
     }
 
     #[cfg(unix)]
