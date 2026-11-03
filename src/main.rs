@@ -265,6 +265,8 @@ struct Viewer {
     history: Option<History>,
     history_error: Option<String>,
     history_limit: usize,
+    branch_filter: String,
+    commit_filter: String,
     loading: bool,
     refresh_pending: bool,
     refresh_error: Option<String>,
@@ -390,6 +392,8 @@ impl Viewer {
             history: None,
             history_error: None,
             history_limit: 100,
+            branch_filter: String::new(),
+            commit_filter: String::new(),
             loading: true,
             refresh_pending: false,
             refresh_error: None,
@@ -781,6 +785,25 @@ fn delete_text_before_cursor(text: &mut String, range: Option<egui::text::CCurso
     text.replace_range(byte_start..byte_end, "");
 }
 
+/// Keep editing and clearing a filter inside the popup; only choosing an item closes it.
+fn picker_filter(ui: &mut egui::Ui, query: &mut String, hint: &str, focus: bool) {
+    ui.horizontal(|ui| {
+        let response = ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text(hint)
+                .desired_width(230.0),
+        );
+        if focus {
+            response.request_focus();
+        }
+        if ui.small_button("×").on_hover_text("Clear filter").clicked() {
+            query.clear();
+            response.request_focus();
+        }
+    });
+    ui.separator();
+}
+
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
@@ -939,6 +962,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 )
             });
             if let Some(repo) = repo_to_open {
+                viewer.branch_filter.clear();
+                viewer.commit_filter.clear();
                 viewer.repo = repo;
                 viewer.target = git::Target::Worktree;
                 viewer.history_source = None;
@@ -950,6 +975,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         let mut branch_choice = None;
         let mut target_choice = None;
         let mut load_more = false;
+        let mut branch_filter = std::mem::take(&mut viewer.branch_filter);
+        let mut commit_filter = std::mem::take(&mut viewer.commit_filter);
         ui.horizontal_wrapped(|ui| {
             if let Some(history) = &viewer.history {
                 ui.label("Branch");
@@ -957,14 +984,23 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 let branch_label = if history.source == "HEAD" {
                     history.branches.current.as_deref().unwrap_or("Detached HEAD")
                 } else { branch_label };
+                let branch_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("branch_selector"));
                 egui::ComboBox::from_id_salt("branch_selector").selected_text(branch_label)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show_ui(ui, |ui| {
+                        picker_filter(ui, &mut branch_filter, "Filter branches…", !branch_was_open);
+                        let query = view::fold_filter_text(&branch_filter);
+                        let mut matches = 0;
                         for branch in &history.branches.local {
+                            if !view::filter_matches(&query, &[branch]) { continue; }
+                            matches += 1;
                             let source = format!("refs/heads/{branch}");
                             if ui.selectable_label(history.source == source, branch).clicked() {
                                 branch_choice = Some(source);
+                                ui.close();
                             }
                         }
+                        if matches == 0 { ui.weak("No matching branches"); }
                     });
                 ui.label("Commit");
                 let selected_label = match &viewer.target {
@@ -974,21 +1010,33 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                         .map(|c| format!("{} — {}", c.short_id, c.subject))
                         .unwrap_or_else(|| format!("Commit {id}")),
                 };
+                let commit_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("commit_selector"));
                 egui::ComboBox::from_id_salt("commit_selector").width(350.0)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .selected_text(selected_label).show_ui(ui, |ui| {
+                        picker_filter(ui, &mut commit_filter, "Filter commits…", !commit_was_open);
+                        ui.weak(format!("Filtering {} loaded commits", history.commits.len()));
                         if ui.selectable_label(matches!(viewer.target, git::Target::Worktree),
                             "Working-tree changes (current checkout)").clicked() {
                             target_choice = Some(git::Target::Worktree);
+                            ui.close();
                         }
+                        let query = view::fold_filter_text(&commit_filter);
+                        let mut matches = 0;
                         for commit in &history.commits {
+                            if !view::filter_matches(&query, &[&commit.id, &commit.short_id, &commit.subject]) { continue; }
+                            matches += 1;
                             if ui.selectable_label(matches!(&viewer.target, git::Target::Commit(id) if id == &commit.id),
                                 format!("{} — {}", commit.short_id, commit.subject)).clicked() {
                                 target_choice = Some(git::Target::Commit(commit.id.clone()));
+                                ui.close();
                             }
                         }
                         if history.commits.is_empty() { ui.label("No commits yet"); }
+                        else if matches == 0 { ui.weak("No matching loaded commits"); }
                         if history.has_more && ui.add_enabled(!viewer.loading, egui::Button::new("Load more…")).clicked() {
                             load_more = true;
+                            ui.close();
                         }
                     });
             }
@@ -996,6 +1044,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             if let Some(error) = &viewer.refresh_error { ui.colored_label(RED, format!("Auto-refresh failed: {error}")); }
             if let Some(error) = &viewer.history_error { ui.colored_label(RED, error); }
         });
+        viewer.branch_filter = branch_filter;
+        viewer.commit_filter = commit_filter;
         if let Some(source) = branch_choice {
             viewer.history_source = Some(source.clone());
             viewer.history_limit = 100;
@@ -1787,6 +1837,57 @@ mod refresh_tests {
         viewer.comparison = Some(c);
         viewer.selected = Some(0);
         (viewer, rx)
+    }
+
+    #[test]
+    fn revision_filters_survive_refresh_and_loading_older_history() {
+        let repo = Repo::new();
+        repo.write("file", "first");
+        repo.commit();
+        let older = repo.git(&["rev-parse", "HEAD"]);
+        repo.write("file", "second");
+        repo.commit();
+        repo.write("file", "working change");
+        let request = repo.request(Some(("file".into(), false)));
+        let (mut viewer, _) = viewer(request.comparison.clone());
+        let target = viewer.target.clone();
+        let selected = viewer.selected_key();
+        viewer.branch_filter = "NO MATCH".into();
+        viewer.commit_filter = older.to_uppercase();
+        let query = view::fold_filter_text(&viewer.commit_filter);
+        let matching = |history: &History| {
+            history
+                .commits
+                .iter()
+                .filter(|c| view::filter_matches(&query, &[&c.id, &c.short_id, &c.subject]))
+                .count()
+        };
+        let first = read_history(&repo.0, None, 1).unwrap();
+        assert!(first.has_more);
+        assert_eq!(matching(&first), 0);
+        viewer.history = Some(first);
+        // Typing and refresh must leave the chosen comparison intact.
+        assert_eq!(viewer.target, target);
+        assert_eq!(viewer.selected_key(), selected);
+        viewer.accept_refresh(
+            viewer.generation,
+            request.selected.clone(),
+            Ok(refresh(&request).unwrap()),
+        );
+        assert_eq!(viewer.target, target);
+        assert_eq!(viewer.selected_key(), selected);
+        assert_eq!(viewer.branch_filter, "NO MATCH");
+        assert_eq!(viewer.commit_filter, older.to_uppercase());
+        viewer.history_limit = 2;
+        viewer.reload(None, false);
+        viewer.accept(Event::History(
+            viewer.generation,
+            read_history(&repo.0, None, 2),
+        ));
+        assert_eq!(viewer.branch_filter, "NO MATCH");
+        assert_eq!(viewer.commit_filter, older.to_uppercase());
+        assert_eq!(matching(viewer.history.as_ref().unwrap()), 1);
+        assert!(!viewer.history.as_ref().unwrap().has_more);
     }
 
     #[test]

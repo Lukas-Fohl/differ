@@ -216,6 +216,19 @@ pub fn file_text(lines: &[DiffLine], new: bool) -> String {
     out
 }
 
+/// Fold each Unicode character consistently for literal picker filtering.
+pub fn fold_filter_text(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Match a pre-folded query against any displayed field, without regex syntax.
+pub fn filter_matches(folded_query: &str, fields: &[&str]) -> bool {
+    folded_query.is_empty()
+        || fields
+            .iter()
+            .any(|field| fold_filter_text(field).contains(folded_query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +239,40 @@ mod tests {
             new: None,
             text: text.into(),
             kind,
+        }
+    }
+
+    #[test]
+    fn picker_filters_are_literal_case_insensitive_and_unicode_aware() {
+        for (query, fields, expected) in [
+            ("", vec!["main"], true),
+            ("FEATURE/", vec!["feature/nested"], true),
+            ("ÉTÉ", vec!["fix/été"], true),
+            ("ΟΣ", vec!["fix/ΟΣ"], true),
+            (".*", vec!["fix/anything"], false),
+            (".*", vec!["Fix .* handling"], true),
+            ("missing", vec!["main"], false),
+            (
+                "ABCDEF12",
+                vec!["abcdef123456789", "abcdef1", "Fix bug"],
+                true,
+            ),
+            (
+                "ABCDEF1",
+                vec!["abcdef123456789", "abcdef1", "Fix bug"],
+                true,
+            ),
+            (
+                "FIX BUG",
+                vec!["abcdef123456789", "abcdef1", "Fix bug"],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                filter_matches(&fold_filter_text(query), &fields),
+                expected,
+                "{query}"
+            );
         }
     }
 
