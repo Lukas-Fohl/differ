@@ -804,6 +804,17 @@ fn picker_filter(ui: &mut egui::Ui, query: &mut String, hint: &str, focus: bool)
     ui.separator();
 }
 
+/// Reserve five result rows plus the filter and other popup controls. The
+/// scroll area still shrinks to its contents when fewer entries are available.
+fn picker_height(ui: &egui::Ui, extra_rows: usize) -> f32 {
+    let row_height =
+        ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
+        ) + ui.spacing().item_spacing.y;
+    // Filter, separator, and a little breathing room above the results.
+    ((8 + extra_rows) as f32 * row_height).max(ui.spacing().combo_height)
+}
+
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
@@ -986,6 +997,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 } else { branch_label };
                 let branch_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("branch_selector"));
                 egui::ComboBox::from_id_salt("branch_selector").selected_text(branch_label)
+                    .height(picker_height(ui, 0))
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show_ui(ui, |ui| {
                         picker_filter(ui, &mut branch_filter, "Filter branches…", !branch_was_open);
@@ -1012,6 +1024,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 };
                 let commit_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("commit_selector"));
                 egui::ComboBox::from_id_salt("commit_selector").width(350.0)
+                    .height(picker_height(ui, 3))
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .selected_text(selected_label).show_ui(ui, |ui| {
                         picker_filter(ui, &mut commit_filter, "Filter commits…", !commit_was_open);
