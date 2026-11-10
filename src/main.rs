@@ -1253,11 +1253,10 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             egui::ScrollArea::both()
         };
         let scroll_key = (file_id(&c, index), split, full);
-        let max_scroll = (rows.len() as f32 * row_height - ui.available_height()).max(0.0);
         let restore_offset = viewer
             .pending_scroll
             .filter(|(key, _)| *key == scroll_key)
-            .map(|(_, offset)| clamp_scroll_offset(offset, max_scroll));
+            .map(|(_, offset)| offset);
         if restore_offset.is_some() {
             viewer.pending_scroll = None;
         }
@@ -1269,11 +1268,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             } else {
                 egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
             });
-        let scroll = if let Some(offset) = restore_offset {
-            scroll.vertical_scroll_offset(offset)
-        } else {
-            scroll
-        };
+        let scroll = restore_code_scroll(scroll, restore_offset);
         let output = if show_change_marks {
             let viewport_height = ui.available_height();
             ui.horizontal(|ui| {
@@ -1504,11 +1499,14 @@ fn preserve_scroll_anchor(offset: f32, old_row_height: f32, new_row_height: f32)
     (offset.max(0.0) / old_row_height) * new_row_height
 }
 
-fn clamp_scroll_offset(offset: f32, max_scroll: f32) -> f32 {
-    if !offset.is_finite() || !max_scroll.is_finite() {
-        return 0.0;
+fn restore_code_scroll(scroll: egui::ScrollArea, offset: Option<f32>) -> egui::ScrollArea {
+    // show_rows includes inter-row spacing in the content height. Let egui clamp
+    // against its measured bounds, including any horizontal scrollbar, rather
+    // than truncating a valid offset on each automatic refresh.
+    match offset {
+        Some(offset) if offset.is_finite() => scroll.vertical_scroll_offset(offset.max(0.0)),
+        _ => scroll,
     }
-    offset.clamp(0.0, max_scroll.max(0.0))
 }
 
 fn cell(
@@ -1632,7 +1630,7 @@ fn cell(
 
 #[cfg(test)]
 mod zoom_tests {
-    use super::{clamp_scroll_offset, preserve_scroll_anchor};
+    use super::{egui, preserve_scroll_anchor, restore_code_scroll};
 
     #[test]
     fn zoom_keeps_the_same_row_and_fraction_at_the_top() {
@@ -1644,13 +1642,66 @@ mod zoom_tests {
     }
 
     #[test]
+    fn restoring_scroll_preserves_bottom_and_clamps_after_content_shrinks() {
+        for horizontal in [false, true] {
+            let ctx = egui::Context::default();
+            let mut offset = None;
+            for row_count in [100, 100, 100, 10] {
+                let mut measured = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.spacing_mut().scroll.floating = false;
+                            let scroll = if horizontal {
+                                egui::ScrollArea::both()
+                            } else {
+                                egui::ScrollArea::vertical()
+                            }
+                            .auto_shrink([false, false]);
+                            let output =
+                                restore_code_scroll(scroll, Some(offset.unwrap_or(10_000.0)))
+                                    .show_rows(ui, 16.0, row_count, |ui, range| {
+                                        for _ in range {
+                                            ui.allocate_space(egui::vec2(800.0, 16.0));
+                                        }
+                                    });
+                            measured = Some((
+                                output.state.offset.y,
+                                (output.content_size.y - output.inner_rect.height()).max(0.0),
+                            ));
+                        });
+                    },
+                );
+                let (actual, maximum) = measured.unwrap();
+                let expected = offset.unwrap_or(10_000.0).min(maximum);
+                assert!(
+                    (actual - expected).abs() < 0.01,
+                    "horizontal={horizontal}, rows={row_count}, actual={actual}, maximum={maximum}"
+                );
+                if row_count == 100 {
+                    // This valid position exceeds the old spacing-free limit.
+                    assert!(actual > 100.0 * 16.0);
+                } else {
+                    assert!(actual < offset.unwrap());
+                }
+                offset = Some(actual);
+            }
+        }
+    }
+
+    #[test]
     fn invalid_and_negative_scroll_values_are_safe() {
         assert_eq!(preserve_scroll_anchor(-8.0, 20.0, 18.0), 0.0);
         assert_eq!(preserve_scroll_anchor(f32::NAN, 20.0, 18.0), 0.0);
         assert_eq!(preserve_scroll_anchor(8.0, 0.0, 18.0), 0.0);
-        assert_eq!(clamp_scroll_offset(500.0, 120.0), 120.0);
-        assert_eq!(clamp_scroll_offset(-2.0, 120.0), 0.0);
-        assert_eq!(clamp_scroll_offset(50.0, 0.0), 0.0);
     }
 }
 
