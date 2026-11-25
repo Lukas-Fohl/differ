@@ -301,6 +301,7 @@ struct Viewer {
     cache: HashMap<usize, Result<Arc<Prepared>, String>>,
     requested: std::collections::HashSet<usize>,
     settings: Settings,
+    sidebar_resize: Option<f32>,
     scroll_offsets: HashMap<(egui::Id, bool, bool), f32>,
     pending_scroll: Option<((egui::Id, bool, bool), f32)>,
 }
@@ -426,6 +427,7 @@ impl Viewer {
             cache: HashMap::new(),
             requested: Default::default(),
             settings,
+            sidebar_resize: None,
             scroll_offsets: HashMap::new(),
             pending_scroll: None,
         }
@@ -705,6 +707,7 @@ impl Viewer {
 
 const CODE_ROW_HEIGHT: f32 = 16.0;
 const SPLIT_COLUMN_GAP: f32 = 12.0;
+const SIDEBAR_DIVIDER_WIDTH: f32 = 10.0;
 
 fn status_color(status: char, dark: bool) -> egui::Color32 {
     let (r, g, b) = match (status, dark) {
@@ -1115,12 +1118,26 @@ fn workspace_footer(ui: &mut egui::Ui, viewer: &mut Viewer) {
 fn toolbar_picker(
     ui: &mut egui::Ui,
     id: &str,
-    label: impl Into<egui::WidgetText>,
+    label: String,
     extra_rows: usize,
     contents: impl FnOnce(&mut egui::Ui, bool),
 ) -> egui::Response {
-    // Reserve the whole control before it measures its text so it wraps as a unit.
-    let width = 132.0_f32.min(ui.max_rect().width());
+    // Measure the whole trigger before wrapping so the arrow stays beside the label.
+    let spacing = ui.spacing();
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.clone(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x;
+    let width =
+        (label_width + spacing.button_padding.x * 2.0 + spacing.icon_spacing + spacing.icon_width)
+            .ceil()
+            .min(132.0)
+            .min(ui.max_rect().width());
     ui.allocate_ui_with_layout(
         egui::vec2(width, ui.spacing().interact_size.y),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -1292,6 +1309,27 @@ fn toolbar(ui: &mut egui::Ui, viewer: &mut Viewer) {
     }
 }
 
+fn sidebar_divider(ctx: &egui::Context) -> egui::Response {
+    egui::SidePanel::left("sidebar_divider")
+        .exact_width(SIDEBAR_DIVIDER_WIDTH)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(egui::Frame::NONE)
+        .show(ctx, |ui| {
+            let rect = ui.max_rect().shrink2(egui::vec2(0.0, 4.0));
+            let response = ui.interact(rect, ui.id().with("resize"), egui::Sense::drag());
+            let color = if response.hovered() || response.dragged() {
+                ui.visuals().selection.stroke.color
+            } else {
+                ui.visuals().window_stroke.color
+            };
+            let grip = egui::Rect::from_center_size(rect.center(), egui::vec2(3.0, 32.0));
+            ui.painter().rect_filled(grip, 2.0, color);
+            response.on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal)
+        })
+        .inner
+}
+
 fn draw(
     mut contexts: EguiContexts,
     mut viewer: NonSendMut<Viewer>,
@@ -1357,105 +1395,119 @@ fn draw(
     {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
-    let left_gutter = if viewer.comparison.is_some() { 4 } else { 8 };
-    if let Some(c) = viewer.comparison.clone() {
-        let max_sidebar_width = (ctx.content_rect().width() - 220.0)
-            .clamp(settings::SIDEBAR_MIN, settings::SIDEBAR_MAX);
-        let sidebar = egui::SidePanel::left("files")
-            .show_separator_line(false)
-            .frame(pane_frame(
-                ctx,
-                egui::Margin {
-                    left: 8,
-                    right: 4,
-                    top: 8,
-                    bottom: 8,
-                },
-            ))
-            .default_width(viewer.settings.sidebar_width)
-            .width_range(settings::SIDEBAR_MIN..=max_sidebar_width)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("CHANGES").small().strong().weak());
-                    ui.weak(c.files.len().to_string());
-                    if viewer.staging_in_progress() {
-                        ui.spinner().on_hover_text("Updating staging area…");
-                    }
-                });
-                ui.add_space(8.0);
-                if let Some(error) = &viewer.refresh_error {
-                    ui.colored_label(error_color, format!("Auto-refresh failed: {error}"));
-                }
-                if let Some(error) = &viewer.staging_error {
-                    ui.colored_label(error_color, error);
-                }
-                let mut selected = viewer.selected;
-                let mut action = None;
-                egui::ScrollArea::both().show(ui, |ui| {
-                    if c.working_tree {
-                        for staged in [true, false] {
-                            let count = c.files.iter().filter(|f| f.staged == staged).count();
-                            ui.push_id(staged, |ui| {
-                                egui::CollapsingHeader::new(format!(
-                                    "{} · {count}",
-                                    if staged { "Staged" } else { "Unstaged" }
-                                ))
-                                .id_salt(("staging_section", staged))
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    let tree = if staged {
-                                        &viewer.staged_tree
-                                    } else {
-                                        &viewer.tree
-                                    };
-                                    tree.show(
-                                        ui,
-                                        &c,
-                                        &mut selected,
-                                        &mut action,
-                                        viewer.staging_in_progress()
-                                            || viewer.refresh_error.is_some(),
-                                    );
-                                });
-                            });
-                        }
-                    } else {
-                        viewer.tree.show(ui, &c, &mut selected, &mut action, true);
-                    }
-                });
-                if let Some(index) = action {
-                    viewer.toggle_staging(&index);
-                }
-                if viewer.selected != selected {
-                    ctx.request_repaint();
-                }
-                viewer.selected = selected;
-            });
-        if !ctx.input(|input| input.pointer.primary_down()) {
-            let width = sidebar
-                .response
-                .rect
-                .width()
-                .clamp(settings::SIDEBAR_MIN, max_sidebar_width);
-            // A smaller window may constrain the pane without changing the preferred width.
-            if width < max_sidebar_width || viewer.settings.sidebar_width <= max_sidebar_width {
-                viewer.settings.sidebar_width = width;
-            }
-        }
-    }
     egui::TopBottomPanel::top("toolbar")
         .show_separator_line(false)
         .frame(pane_frame(
             ctx,
             egui::Margin {
-                left: left_gutter,
+                left: 8,
                 right: 8,
                 top: 8,
                 bottom: 4,
             },
         ))
         .show(ctx, |ui| toolbar(ui, &mut viewer));
+    let left_gutter = if viewer.comparison.is_some() { 0 } else { 8 };
+    if let Some(c) = viewer.comparison.clone() {
+        let max_sidebar_width = (ctx.content_rect().width() - 220.0 - SIDEBAR_DIVIDER_WIDTH)
+            .clamp(settings::SIDEBAR_MIN, settings::SIDEBAR_MAX);
+        let sidebar_width = viewer
+            .sidebar_resize
+            .unwrap_or(viewer.settings.sidebar_width)
+            .clamp(settings::SIDEBAR_MIN, max_sidebar_width);
+        let frame = pane_frame(
+            ctx,
+            egui::Margin {
+                left: 8,
+                right: 0,
+                top: 4,
+                bottom: 8,
+            },
+        );
+        egui::SidePanel::left("files")
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE)
+            .exact_width(sidebar_width)
+            .resizable(false)
+            .show(ctx, |ui| {
+                frame.show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("CHANGES").small().strong().weak());
+                        ui.weak(c.files.len().to_string());
+                        if viewer.staging_in_progress() {
+                            ui.spinner().on_hover_text("Updating staging area…");
+                        }
+                    });
+                    ui.add_space(8.0);
+                    if let Some(error) = &viewer.refresh_error {
+                        ui.colored_label(error_color, format!("Auto-refresh failed: {error}"));
+                    }
+                    if let Some(error) = &viewer.staging_error {
+                        ui.colored_label(error_color, error);
+                    }
+                    let mut selected = viewer.selected;
+                    let mut action = None;
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        if c.working_tree {
+                            for staged in [true, false] {
+                                let count = c.files.iter().filter(|f| f.staged == staged).count();
+                                ui.push_id(staged, |ui| {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{} · {count}",
+                                        if staged { "Staged" } else { "Unstaged" }
+                                    ))
+                                    .id_salt(("staging_section", staged))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        let tree = if staged {
+                                            &viewer.staged_tree
+                                        } else {
+                                            &viewer.tree
+                                        };
+                                        tree.show(
+                                            ui,
+                                            &c,
+                                            &mut selected,
+                                            &mut action,
+                                            viewer.staging_in_progress()
+                                                || viewer.refresh_error.is_some(),
+                                        );
+                                    });
+                                });
+                            }
+                        } else {
+                            viewer.tree.show(ui, &c, &mut selected, &mut action, true);
+                        }
+                    });
+                    if let Some(index) = action {
+                        viewer.toggle_staging(&index);
+                    }
+                    if viewer.selected != selected {
+                        ctx.request_repaint();
+                    }
+                    viewer.selected = selected;
+                });
+            });
+        let divider = sidebar_divider(ctx);
+        if divider.dragged() {
+            viewer.sidebar_resize = Some(
+                (sidebar_width + divider.drag_delta().x)
+                    .clamp(settings::SIDEBAR_MIN, max_sidebar_width),
+            );
+            ctx.request_repaint();
+        }
+        if divider.drag_stopped() {
+            if let Some(width) = viewer.sidebar_resize.take() {
+                let final_delta = ctx.input(|input| input.pointer.delta().x);
+                viewer.settings.sidebar_width =
+                    (width + final_delta).clamp(settings::SIDEBAR_MIN, max_sidebar_width);
+                ctx.request_repaint();
+            }
+        }
+    } else {
+        viewer.sidebar_resize = None;
+    }
     egui::TopBottomPanel::bottom("workspace_footer")
         .show_separator_line(false)
         .frame(
@@ -2249,7 +2301,7 @@ mod selection_tests {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(275.0, 240.0),
+                    egui::vec2(210.0, 240.0),
                 )),
                 ..Default::default()
             },
@@ -2258,8 +2310,9 @@ mod selection_tests {
                     let right_edge = ui.max_rect().right();
                     ui.horizontal_wrapped(|ui| {
                         let branch =
-                            toolbar_picker(ui, "branch", "A long branch name", 0, |_, _| {});
-                        let commit = toolbar_picker(ui, "commit", "Working tree", 0, |_, _| {});
+                            toolbar_picker(ui, "branch", "A long branch name".into(), 0, |_, _| {});
+                        let commit =
+                            toolbar_picker(ui, "commit", "Working tree".into(), 0, |_, _| {});
                         assert!(commit.rect.top() >= branch.rect.bottom());
                         assert!(commit.rect.right() <= right_edge);
                     });
