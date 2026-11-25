@@ -786,6 +786,36 @@ fn viewer_visuals(light: bool) -> egui::Visuals {
     visuals
 }
 
+fn scrollbar_style(reserved: bool) -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: !reserved,
+        bar_width: if reserved { 7.0 } else { 9.0 },
+        floating_width: 4.0,
+        handle_min_length: 28.0,
+        bar_inner_margin: 3.0,
+        bar_outer_margin: 2.0,
+        foreground_color: !reserved,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 0.22,
+        active_handle_opacity: 0.38,
+        interact_handle_opacity: 0.68,
+        ..egui::style::ScrollStyle::floating()
+    }
+}
+
+fn style_reserved_scrollbar(ui: &mut egui::Ui) {
+    let thumb = ui.visuals().weak_text_color();
+    let accent = ui.visuals().selection.stroke.color;
+    ui.spacing_mut().scroll = scrollbar_style(true);
+    let visuals = &mut ui.style_mut().visuals;
+    visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+    visuals.widgets.inactive.bg_fill = thumb.gamma_multiply(0.55);
+    visuals.widgets.hovered.bg_fill = thumb.gamma_multiply(0.8);
+    visuals.widgets.active.bg_fill = accent;
+}
+
 fn pane_frame(ctx: &egui::Context, outer_margin: egui::Margin) -> egui::Frame {
     let style = ctx.style();
     egui::Frame::new()
@@ -1377,6 +1407,7 @@ fn draw(
         adjust_code_zoom(&mut viewer, zoom_in, scroll_key);
     }
     ctx.set_visuals(viewer_visuals(viewer.settings.light_mode));
+    ctx.style_mut(|style| style.spacing.scroll = scrollbar_style(false));
     let backdrop = if viewer.settings.light_mode {
         egui::Color32::from_rgb(232, 229, 235)
     } else {
@@ -1448,38 +1479,41 @@ fn draw(
                     }
                     let mut selected = viewer.selected;
                     let mut action = None;
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        if c.working_tree {
-                            for staged in [true, false] {
-                                let count = c.files.iter().filter(|f| f.staged == staged).count();
-                                ui.push_id(staged, |ui| {
-                                    egui::CollapsingHeader::new(format!(
-                                        "{} · {count}",
-                                        if staged { "Staged" } else { "Unstaged" }
-                                    ))
-                                    .id_salt(("staging_section", staged))
-                                    .default_open(true)
-                                    .show(ui, |ui| {
-                                        let tree = if staged {
-                                            &viewer.staged_tree
-                                        } else {
-                                            &viewer.tree
-                                        };
-                                        tree.show(
-                                            ui,
-                                            &c,
-                                            &mut selected,
-                                            &mut action,
-                                            viewer.staging_in_progress()
-                                                || viewer.refresh_error.is_some(),
-                                        );
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if c.working_tree {
+                                for staged in [true, false] {
+                                    let count =
+                                        c.files.iter().filter(|f| f.staged == staged).count();
+                                    ui.push_id(staged, |ui| {
+                                        egui::CollapsingHeader::new(format!(
+                                            "{} · {count}",
+                                            if staged { "Staged" } else { "Unstaged" }
+                                        ))
+                                        .id_salt(("staging_section", staged))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            let tree = if staged {
+                                                &viewer.staged_tree
+                                            } else {
+                                                &viewer.tree
+                                            };
+                                            tree.show(
+                                                ui,
+                                                &c,
+                                                &mut selected,
+                                                &mut action,
+                                                viewer.staging_in_progress()
+                                                    || viewer.refresh_error.is_some(),
+                                            );
+                                        });
                                     });
-                                });
+                                }
+                            } else {
+                                viewer.tree.show(ui, &c, &mut selected, &mut action, true);
                             }
-                        } else {
-                            viewer.tree.show(ui, &c, &mut selected, &mut action, true);
-                        }
-                    });
+                        });
                     if let Some(index) = action {
                         viewer.toggle_staging(&index);
                     }
@@ -1699,11 +1733,8 @@ fn draw(
         let row_height = CODE_ROW_HEIGHT * zoom;
         let full = viewer.settings.full;
         let show_change_marks = full && rows.len() as f32 * row_height > ui.available_height();
-        let marks_width = 8.0;
-        let mut overview_scroll_style = ui.spacing().scroll;
-        overview_scroll_style.floating = false;
-        overview_scroll_style.dormant_background_opacity = 0.25;
-        overview_scroll_style.dormant_handle_opacity = 0.65;
+        let marks_width = 5.0;
+        let overview_scroll_style = scrollbar_style(true);
         let (scroll_width, viewport_width) = if show_change_marks {
             let scroll_width =
                 (ui.available_width() - marks_width - ui.spacing().item_spacing.x).max(1.0);
@@ -1741,7 +1772,7 @@ fn draw(
         } else {
             0.0
         };
-        let scroll = if split {
+        let scroll = if split || content_width <= viewport_width {
             egui::ScrollArea::vertical()
         } else {
             egui::ScrollArea::both()
@@ -1771,9 +1802,8 @@ fn draw(
                         egui::vec2(scroll_width, viewport_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |scroll_ui| {
-                            let original_style = scroll_ui.spacing().scroll;
-                            scroll_ui.spacing_mut().scroll = overview_scroll_style;
-                            let output = scroll.show_rows(
+                            style_reserved_scrollbar(scroll_ui);
+                            scroll.show_rows(
                                 scroll_ui,
                                 row_height,
                                 rows.len(),
@@ -1790,9 +1820,7 @@ fn draw(
                                         zoom,
                                     );
                                 },
-                            );
-                            scroll_ui.spacing_mut().scroll = original_style;
-                            output
+                            )
                         },
                     )
                     .inner;
@@ -1859,13 +1887,13 @@ fn split_horizontal_scroll(
         }
     }
 
-    scroll
-        .show(ui, |ui| {
-            ui.allocate_space(egui::vec2(viewport_width + max_offset, 2.0));
-        })
-        .state
-        .offset
-        .x
+    let original_style = ui.style().clone();
+    style_reserved_scrollbar(ui);
+    let output = scroll.show(ui, |ui| {
+        ui.allocate_space(egui::vec2(viewport_width + max_offset, 1.0));
+    });
+    ui.set_style(original_style);
+    output.state.offset.x
 }
 
 fn adjust_code_zoom(
@@ -1974,7 +2002,6 @@ fn paint_change_overview(
         return;
     }
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().widgets.noninteractive.bg_fill);
     for (row_index, row) in rows.iter().enumerate() {
         let mut removed = false;
         let mut added = false;
