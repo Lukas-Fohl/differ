@@ -90,6 +90,7 @@ struct RefreshRequest {
     comparison: Arc<Comparison>,
     target: git::Target,
     selected: Option<FileKey>,
+    follow: Option<FileKey>,
     source: Option<String>,
     limit: usize,
     refs: Option<Vec<u8>>,
@@ -117,8 +118,9 @@ fn refresh(request: &RefreshRequest) -> Result<RefreshResult, String> {
         Arc::new(git::compare(repo, request.target.clone())?)
     };
     let selected = request
-        .selected
+        .follow
         .as_ref()
+        .or(request.selected.as_ref())
         .and_then(|key| find_file(&comparison, key))
         .map(|index| {
             git::load_file(&comparison, index).map(|diff| (index, Arc::new(Prepared::new(diff))))
@@ -525,6 +527,7 @@ impl Viewer {
             comparison,
             target: self.target.clone(),
             selected: self.selected_key(),
+            follow: self.follow_file.take(),
             source: self.history_source.clone(),
             limit: self.history_limit,
             refs: self.refs.clone(),
@@ -643,9 +646,8 @@ impl Viewer {
                 if generation == self.generation {
                     match result {
                         Ok(()) => {
-                            let source = self.history_source.clone();
-                            self.reload(source, false);
                             self.follow_file = Some((file.path, !file.staged));
+                            self.start_refresh(Instant::now());
                         }
                         Err(error) => self.staging_error = Some(error),
                     }
@@ -668,14 +670,7 @@ impl Viewer {
                         }
                         self.tree = Tree::new(&c, false);
                         self.staged_tree = Tree::new(&c, true);
-                        self.selected = if let Some((path, staged)) = self.follow_file.take() {
-                            c.files
-                                .iter()
-                                .position(|f| f.path == path && f.staged == staged)
-                                .or_else(|| c.files.iter().position(|f| f.path == path))
-                        } else {
-                            (!c.files.is_empty()).then_some(0)
-                        };
+                        self.selected = (!c.files.is_empty()).then_some(0);
                         self.comparison = Some(c);
                     }
                     Err(error) => self.error = Some(error),
@@ -1781,12 +1776,14 @@ mod selection_tests {
         viewer.accept(Event::Staging(1, file.clone(), Err("index locked".into())));
         assert_eq!(viewer.staging_error.as_deref(), Some("index locked"));
         assert!(viewer.comparison.is_some());
+        viewer.loading = false;
         viewer.accept(Event::Staging(1, file, Ok(())));
-        assert!(matches!(
-            received.try_recv(),
-            Ok(Request::Reload { generation: 2, .. })
-        ));
-        assert_eq!(viewer.follow_file, Some(("file".into(), true)));
+        let Request::Refresh(request) = received.try_recv().unwrap() else {
+            panic!("staging should refresh without clearing the view");
+        };
+        assert_eq!(request.follow, Some(("file".into(), true)));
+        assert!(viewer.comparison.is_some());
+        assert!(!viewer.loading);
     }
 
     #[test]
@@ -1875,6 +1872,7 @@ mod refresh_tests {
                 comparison: Arc::new(git::compare(&self.0, git::Target::Worktree).unwrap()),
                 target: git::Target::Worktree,
                 selected,
+                follow: None,
                 source: None,
                 limit: 100,
                 refs: None,
@@ -1901,6 +1899,69 @@ mod refresh_tests {
         viewer.comparison = Some(c);
         viewer.selected = Some(0);
         (viewer, rx)
+    }
+
+    #[test]
+    fn staging_refresh_keeps_diff_visible_and_follows_file_with_scroll() {
+        let repo = Repo::new();
+        repo.write("file", "base\n");
+        repo.commit();
+        repo.write("file", "staged part\n");
+        repo.git(&["add", "file"]);
+        repo.write("file", "working part\n");
+        let initial = repo.request(Some(("file".into(), false)));
+        let (mut viewer, requests) = viewer(initial.comparison.clone());
+        viewer.selected = find_file(&initial.comparison, initial.selected.as_ref().unwrap());
+        let index = viewer.selected.unwrap();
+        viewer.cache.insert(
+            index,
+            Ok(Arc::new(Prepared::new(
+                git::load_file(&initial.comparison, index).unwrap(),
+            ))),
+        );
+
+        for staged in [true, false] {
+            let index = viewer.selected.unwrap();
+            let before = viewer.comparison.clone().unwrap();
+            let prepared = viewer.cache[&index].as_ref().unwrap().clone();
+            let scroll_key = (file_id(&before, index), false, false);
+            viewer.scroll_offsets.insert(scroll_key, 75.0);
+            viewer.toggle_staging(&[index]);
+            let Request::ToggleStaging(generation, path, files) = requests.try_recv().unwrap()
+            else {
+                panic!("expected staging request");
+            };
+            git::toggle_staging_files(&path, &files).unwrap();
+            viewer.accept(Event::Staging(generation, files[0].clone(), Ok(())));
+            assert!(!viewer.loading);
+            assert!(Arc::ptr_eq(viewer.comparison.as_ref().unwrap(), &before));
+            assert!(Arc::ptr_eq(
+                viewer.cache[&index].as_ref().unwrap(),
+                &prepared
+            ));
+            assert_eq!(viewer.scroll_offsets[&scroll_key], 75.0);
+
+            let Request::Refresh(request) = requests.try_recv().unwrap() else {
+                panic!("expected background refresh");
+            };
+            let result = refresh(&request).unwrap();
+            viewer.accept(Event::Refreshed(generation, request.selected, Ok(result)));
+            assert_eq!(viewer.selected_key(), Some(("file".into(), staged)));
+            let index = viewer.selected.unwrap();
+            assert!(viewer.cache[&index].is_ok());
+            assert_eq!(
+                viewer.pending_scroll,
+                Some((
+                    (
+                        file_id(viewer.comparison.as_ref().unwrap(), index),
+                        false,
+                        false,
+                    ),
+                    75.0
+                ))
+            );
+            assert!(!viewer.loading);
+        }
     }
 
     #[test]
