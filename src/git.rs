@@ -213,7 +213,7 @@ fn resolve(repo: &Path, name: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
 }
 
-fn normalize_repo(repo: &Path) -> Result<PathBuf, String> {
+pub fn normalize_repo(repo: &Path) -> Result<PathBuf, String> {
     let bytes = checked(repo, &[arg("rev-parse"), arg("--show-toplevel")])?;
     let root = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
     Ok(path_from_bytes(root))

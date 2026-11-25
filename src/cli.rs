@@ -7,7 +7,7 @@ USAGE:
     differ [OPTIONS]
 
 OPTIONS:
-    --repo PATH       Git repository to open (default: current directory)
+    --repo PATH       Git repository to open (default: last project or current directory)
     --branch REF      Compare checked-out HEAD with a local branch tip
     --commit REF      Compare a commit with its first parent
     -h, --help        Print this help
@@ -37,18 +37,18 @@ Double-click a working-tree file to stage or unstage it. The viewer does not
 check out branches, commit, or discard working-tree content.";
 
 pub struct Options {
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     pub target: Target,
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
     let mut args = args.into_iter();
-    let mut repo = PathBuf::from(".");
+    let mut repo = None;
     let mut target = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "-h") => return Ok(None),
-            Some("--repo") => repo = args.next().ok_or("--repo requires a path")?.into(),
+            Some("--repo") => repo = Some(args.next().ok_or("--repo requires a path")?.into()),
             Some(flag @ ("--branch" | "--commit")) => {
                 if target.is_some() {
                     return Err("Choose exactly one of --branch and --commit".into());
@@ -96,7 +96,12 @@ mod tests {
         let o = args(&["--repo", "/tmp/a b", "--commit", "HEAD~2"])
             .unwrap()
             .unwrap();
-        assert_eq!(o.repo, PathBuf::from("/tmp/a b"));
+        assert_eq!(o.repo, Some(PathBuf::from("/tmp/a b")));
+        assert_eq!(
+            args(&["--repo", "."]).unwrap().unwrap().repo,
+            Some(".".into())
+        );
+        assert!(args(&[]).unwrap().unwrap().repo.is_none());
         assert!(matches!(o.target, Target::Commit(s) if s == "HEAD~2"));
     }
 }

@@ -19,7 +19,7 @@ cargo run -- --commit abc123
 cargo run -- --help
 ```
 
-The repository defaults to the current directory. Subdirectories within a repository are accepted. With neither `--branch` nor `--commit`, the app shows staged and unstaged changes and untracked, non-ignored files in the current checkout. Ignored files are excluded. `--branch` and `--commit` are mutually exclusive. Local branches use their short name; remote branches can use a full ref such as `refs/remotes/origin/feature`.
+Starting Differ with no options reopens the last successfully opened project, or uses the current directory if that project is unavailable. Pass `--repo .` to open the current directory explicitly. With `--branch` or `--commit` alone, the current directory is used. Subdirectories within a repository are accepted. With neither `--branch` nor `--commit`, the app shows staged and unstaged changes and untracked, non-ignored files in the current checkout. Ignored files are excluded. `--branch` and `--commit` are mutually exclusive. Local branches use their short name; remote branches can use a full ref such as `refs/remotes/origin/feature`.
 
 - **Branch:** checked-out `HEAD` → selected branch tip. Choosing the checked-out branch shows no changes.
 - **Commit:** first parent → selected commit. A root commit compares with an empty tree; a merge commit compares with its first parent.
@@ -27,6 +27,8 @@ The repository defaults to the current directory. Subdirectories within a reposi
 Revisions and working-tree changes are loaded at startup. While the app is focused, changes refresh automatically about once a second and immediately when focus returns. The selected file and scroll position are preserved. Open the **Project** menu to reload immediately, browse for a folder, or enter another repository path and choose **Open**. Double-clicking a file stages or unstages it. The app never checks out branches, commits, or discards working-tree content.
 
 ## Interface
+
+Differ saves the theme, diff layout, context mode, code zoom, sidebar width, and last project on this machine. On Linux, the file is `$XDG_CONFIG_HOME/differ/settings` or `~/.config/differ/settings`.
 
 Select a changed file in the collapsible tree. Working-tree files are grouped into **Staged** and **Unstaged** sections. Single-click previews that section’s diff. Use **Stage file** or **Unstage file** above the diff, or double-click the file in the sidebar. Both actions preserve its working-tree contents. Double-click a directory row to stage or unstage all changed files beneath it, including nested directories. Single-click still expands or collapses the directory. Partially staged files appear in both sections. Conflicted files must be resolved before using these actions. Drag the sidebar divider to resize it. In **Project**, edit the path or browse with the native folder dialog to switch repositories without restarting. Relative paths in the project field are resolved from `$HOME`.
 

@@ -1,3 +1,5 @@
+mod settings;
+
 use bevy::prelude::*;
 use bevy::winit::WinitSettings;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
@@ -6,6 +8,7 @@ use differ::{
     git::{self, Comparison, FileDiff, LineKind},
     view,
 };
+use settings::Settings;
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
@@ -297,18 +300,16 @@ struct Viewer {
     selected: Option<usize>,
     cache: HashMap<usize, Result<Arc<Prepared>, String>>,
     requested: std::collections::HashSet<usize>,
-    split: bool,
-    full: bool,
-    light_mode: bool,
-    code_zoom: f32,
+    settings: Settings,
     scroll_offsets: HashMap<(egui::Id, bool, bool), f32>,
     pending_scroll: Option<((egui::Id, bool, bool), f32)>,
 }
 impl Viewer {
-    fn start(options: cli::Options) -> Self {
+    fn start(options: cli::Options, settings: Settings) -> Self {
+        let repo = startup_repo(options.repo, &options.target, settings.last_repo.as_deref());
         let (events_tx, events) = mpsc::channel();
         let (requests, requests_rx) = mpsc::channel();
-        let repo_input = project_path_for_input(&options.repo);
+        let repo_input = project_path_for_input(&repo);
         let latest_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = latest_generation.clone();
         thread::spawn(move || {
@@ -388,7 +389,7 @@ impl Viewer {
         };
         let _ = requests.send(Request::Reload {
             generation: 0,
-            repo: options.repo.clone(),
+            repo: repo.clone(),
             target: options.target.clone(),
             source: source.clone(),
             limit: 100,
@@ -398,7 +399,7 @@ impl Viewer {
             events,
             requests,
             repo_input,
-            repo: options.repo,
+            repo,
             generation: 0,
             target: options.target,
             history: None,
@@ -424,10 +425,7 @@ impl Viewer {
             selected: None,
             cache: HashMap::new(),
             requested: Default::default(),
-            split: false,
-            full: false,
-            light_mode: false,
-            code_zoom: 1.0,
+            settings,
             scroll_offsets: HashMap::new(),
             pending_scroll: None,
         }
@@ -621,13 +619,17 @@ impl Viewer {
             };
             self.cache.insert(index, Ok(prepared));
             self.requested.insert(index);
-            let key = (file_id(&c, index), self.split, self.full);
+            let key = (file_id(&c, index), self.settings.split, self.settings.full);
             // Follow the same path when external staging moves it between sections.
             let offset = self.scroll_offsets.get(&key).copied().or_else(|| {
                 let old = self.comparison.as_ref()?;
                 let old_index = selected.as_ref().and_then(|key| find_file(old, key))?;
                 self.scroll_offsets
-                    .get(&(file_id(old, old_index), self.split, self.full))
+                    .get(&(
+                        file_id(old, old_index),
+                        self.settings.split,
+                        self.settings.full,
+                    ))
                     .copied()
             });
             if let Some(offset) = offset {
@@ -687,6 +689,7 @@ impl Viewer {
                         self.tree = Tree::new(&c, false);
                         self.staged_tree = Tree::new(&c, true);
                         self.selected = (!c.files.is_empty()).then_some(0);
+                        self.settings.last_repo = Some(c.repo.clone());
                         self.comparison = Some(c);
                     }
                     Err(error) => self.error = Some(error),
@@ -701,6 +704,7 @@ impl Viewer {
 }
 
 const CODE_ROW_HEIGHT: f32 = 16.0;
+const SPLIT_COLUMN_GAP: f32 = 12.0;
 
 fn status_color(status: char, dark: bool) -> egui::Color32 {
     let (r, g, b) = match (status, dark) {
@@ -789,6 +793,56 @@ fn pane_frame(ctx: &egui::Context, outer_margin: egui::Margin) -> egui::Frame {
         .outer_margin(outer_margin)
 }
 
+fn startup_repo(
+    explicit: Option<std::path::PathBuf>,
+    target: &git::Target,
+    last_repo: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    if let Some(repo) = explicit {
+        return repo;
+    }
+    if matches!(target, git::Target::Worktree) {
+        if let Some(repo) = last_repo.and_then(|path| git::normalize_repo(path).ok()) {
+            return repo;
+        }
+    }
+    ".".into()
+}
+
+#[derive(Resource)]
+struct SettingsStore {
+    path: Option<std::path::PathBuf>,
+    last_attempted: Settings,
+}
+
+impl SettingsStore {
+    fn load() -> Self {
+        let path = settings::config_path();
+        let last_attempted = path.as_deref().map_or_else(Settings::default, |path| {
+            Settings::load(path).unwrap_or_else(|error| {
+                eprintln!("Could not read Differ settings: {error}");
+                Settings::default()
+            })
+        });
+        Self {
+            path,
+            last_attempted,
+        }
+    }
+
+    fn save_changes(&mut self, settings: &Settings) {
+        if self.last_attempted == *settings {
+            return;
+        }
+        self.last_attempted = settings.clone();
+        if let Some(path) = &self.path {
+            if let Err(error) = settings.save(path) {
+                eprintln!("Could not save Differ settings: {error}");
+            }
+        }
+    }
+}
+
 fn main() {
     let options = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Some(options)) => options,
@@ -801,8 +855,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let store = SettingsStore::load();
+    let viewer = Viewer::start(options, store.last_attempted.clone());
     App::new()
-        .insert_non_send_resource(Viewer::start(options))
+        .insert_non_send_resource(viewer)
+        .insert_resource(store)
         .insert_resource(WinitSettings::desktop_app())
         .add_plugins(
             DefaultPlugins
@@ -1005,12 +1062,12 @@ fn project_menu(ui: &mut egui::Ui, viewer: &mut Viewer) {
 fn view_controls(ui: &mut egui::Ui, viewer: &mut Viewer) {
     ui.horizontal_wrapped(|ui| {
         ui.group(|ui| {
-            ui.selectable_value(&mut viewer.split, false, "Inline");
-            ui.selectable_value(&mut viewer.split, true, "Side by side");
+            ui.selectable_value(&mut viewer.settings.split, false, "Inline");
+            ui.selectable_value(&mut viewer.settings.split, true, "Side by side");
         });
         ui.group(|ui| {
-            ui.selectable_value(&mut viewer.full, false, "Changes");
-            ui.selectable_value(&mut viewer.full, true, "Full file");
+            ui.selectable_value(&mut viewer.settings.full, false, "Changes");
+            ui.selectable_value(&mut viewer.settings.full, true, "Full file");
         });
     });
 }
@@ -1019,34 +1076,37 @@ fn workspace_footer(ui: &mut egui::Ui, viewer: &mut Viewer) {
     ui.horizontal_wrapped(|ui| {
         ui.weak("Code zoom");
         let scroll_key = viewer.selected.and_then(|index| {
-            viewer
-                .comparison
-                .as_ref()
-                .map(|c| (file_id(c, index), viewer.split, viewer.full))
+            viewer.comparison.as_ref().map(|c| {
+                (
+                    file_id(c, index),
+                    viewer.settings.split,
+                    viewer.settings.full,
+                )
+            })
         });
         if ui
-            .add_enabled(viewer.code_zoom > 0.5, egui::Button::new("−"))
+            .add_enabled(viewer.settings.code_zoom > 0.5, egui::Button::new("−"))
             .on_hover_text("Zoom out (Ctrl+-)")
             .clicked()
         {
             adjust_code_zoom(viewer, false, scroll_key);
         }
-        ui.label(format!("{:.0}%", viewer.code_zoom * 100.0));
+        ui.label(format!("{:.0}%", viewer.settings.code_zoom * 100.0));
         if ui
-            .add_enabled(viewer.code_zoom < 2.0, egui::Button::new("+"))
+            .add_enabled(viewer.settings.code_zoom < 2.0, egui::Button::new("+"))
             .on_hover_text("Zoom in (Ctrl++)")
             .clicked()
         {
             adjust_code_zoom(viewer, true, scroll_key);
         }
         ui.separator();
-        let theme = if viewer.light_mode {
+        let theme = if viewer.settings.light_mode {
             "Dark theme"
         } else {
             "Light theme"
         };
         if ui.button(theme).clicked() {
-            viewer.light_mode = !viewer.light_mode;
+            viewer.settings.light_mode = !viewer.settings.light_mode;
             ui.ctx().request_repaint();
         }
     });
@@ -1232,7 +1292,11 @@ fn toolbar(ui: &mut egui::Ui, viewer: &mut Viewer) {
     }
 }
 
-fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
+fn draw(
+    mut contexts: EguiContexts,
+    mut viewer: NonSendMut<Viewer>,
+    mut store: ResMut<SettingsStore>,
+) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
     let focused = ctx.input(|input| input.raw.focused);
@@ -1264,22 +1328,25 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     });
     if let Some(zoom_in) = zoom_shortcut {
         let scroll_key = viewer.selected.and_then(|index| {
-            viewer
-                .comparison
-                .as_ref()
-                .map(|c| (file_id(c, index), viewer.split, viewer.full))
+            viewer.comparison.as_ref().map(|c| {
+                (
+                    file_id(c, index),
+                    viewer.settings.split,
+                    viewer.settings.full,
+                )
+            })
         });
         adjust_code_zoom(&mut viewer, zoom_in, scroll_key);
     }
-    ctx.set_visuals(viewer_visuals(viewer.light_mode));
-    let backdrop = if viewer.light_mode {
+    ctx.set_visuals(viewer_visuals(viewer.settings.light_mode));
+    let backdrop = if viewer.settings.light_mode {
         egui::Color32::from_rgb(232, 229, 235)
     } else {
         egui::Color32::from_rgb(22, 21, 25)
     };
     ctx.layer_painter(egui::LayerId::background())
         .rect_filled(ctx.content_rect(), 0, backdrop);
-    let error_color = status_color('D', !viewer.light_mode);
+    let error_color = status_color('D', !viewer.settings.light_mode);
     if viewer.staging_pending
         || viewer.refresh_pending
         || viewer.loading
@@ -1292,7 +1359,9 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     }
     let left_gutter = if viewer.comparison.is_some() { 4 } else { 8 };
     if let Some(c) = viewer.comparison.clone() {
-        egui::SidePanel::left("files")
+        let max_sidebar_width = (ctx.content_rect().width() - 220.0)
+            .clamp(settings::SIDEBAR_MIN, settings::SIDEBAR_MAX);
+        let sidebar = egui::SidePanel::left("files")
             .show_separator_line(false)
             .frame(pane_frame(
                 ctx,
@@ -1303,8 +1372,8 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                     bottom: 8,
                 },
             ))
-            .default_width(244.0)
-            .width_range(140.0..=600.0)
+            .default_width(viewer.settings.sidebar_width)
+            .width_range(settings::SIDEBAR_MIN..=max_sidebar_width)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1363,6 +1432,17 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 }
                 viewer.selected = selected;
             });
+        if !ctx.input(|input| input.pointer.primary_down()) {
+            let width = sidebar
+                .response
+                .rect
+                .width()
+                .clamp(settings::SIDEBAR_MIN, max_sidebar_width);
+            // A smaller window may constrain the pane without changing the preferred width.
+            if width < max_sidebar_width || viewer.settings.sidebar_width <= max_sidebar_width {
+                viewer.settings.sidebar_width = width;
+            }
+        }
     }
     egui::TopBottomPanel::top("toolbar")
         .show_separator_line(false)
@@ -1400,7 +1480,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             bottom: 4,
         },
     )
-    .inner_margin(egui::Margin::symmetric(14, 10))
+    .inner_margin(egui::Margin::symmetric(12, 10))
     .fill(ctx.style().visuals.extreme_bg_color);
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         if let Some(error) = &viewer.error {
@@ -1561,24 +1641,44 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         if prepared.diff.rows.is_empty() {
             return;
         }
-        let split = viewer.split;
-        let rows = &prepared.layouts[usize::from(split) + 2 * usize::from(viewer.full)];
-        let zoom = viewer.code_zoom;
+        let split = viewer.settings.split;
+        let rows = &prepared.layouts[usize::from(split) + 2 * usize::from(viewer.settings.full)];
+        let zoom = viewer.settings.code_zoom;
         let row_height = CODE_ROW_HEIGHT * zoom;
-        let full = viewer.full;
+        let full = viewer.settings.full;
         let show_change_marks = full && rows.len() as f32 * row_height > ui.available_height();
-        let marks_width = if show_change_marks { 8.0 } else { 0.0 };
-        let viewport_width = (ui.available_width() - marks_width).max(1.0);
+        let marks_width = 8.0;
+        let mut overview_scroll_style = ui.spacing().scroll;
+        overview_scroll_style.floating = false;
+        overview_scroll_style.dormant_background_opacity = 0.25;
+        overview_scroll_style.dormant_handle_opacity = 0.65;
+        let (scroll_width, viewport_width) = if show_change_marks {
+            let scroll_width =
+                (ui.available_width() - marks_width - ui.spacing().item_spacing.x).max(1.0);
+            (
+                scroll_width,
+                (scroll_width - overview_scroll_style.allocated_width()).max(1.0),
+            )
+        } else {
+            (ui.available_width(), ui.available_width())
+        };
         let content_width = (prepared.width as f32 * 8.5 + 140.0) * zoom;
         let width = if split {
-            ((viewport_width - 24.0) / 2.0).max(100.0)
+            ((viewport_width - SPLIT_COLUMN_GAP) / 2.0).max(0.0)
         } else {
             content_width.max(viewport_width)
         };
         let horizontal_offset = if split {
-            ui.columns(2, |cols| {
-                cols[0].weak("Old");
-                cols[1].weak("New");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SPLIT_COLUMN_GAP;
+                for heading in ["Old", "New"] {
+                    ui.add_sized(
+                        [width, ui.text_style_height(&egui::TextStyle::Body)],
+                        egui::Label::new(egui::RichText::new(heading).weak())
+                            .truncate()
+                            .halign(egui::Align::LEFT),
+                    );
+                }
             });
             split_horizontal_scroll(
                 ui,
@@ -1614,18 +1714,13 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         let output = if show_change_marks {
             let viewport_height = ui.available_height();
             ui.horizontal(|ui| {
-                let scroll_width = (ui.available_width() - marks_width).max(1.0);
                 let output = ui
                     .allocate_ui_with_layout(
                         egui::vec2(scroll_width, viewport_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |scroll_ui| {
                             let original_style = scroll_ui.spacing().scroll;
-                            let mut overview_style = original_style;
-                            overview_style.floating = false;
-                            overview_style.dormant_background_opacity = 0.25;
-                            overview_style.dormant_handle_opacity = 0.65;
-                            scroll_ui.spacing_mut().scroll = overview_style;
+                            scroll_ui.spacing_mut().scroll = overview_scroll_style;
                             let output = scroll.show_rows(
                                 scroll_ui,
                                 row_height,
@@ -1677,6 +1772,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             .insert(scroll_key, output.state.offset.y);
     });
     viewer.pending_scroll = None;
+    store.save_changes(&viewer.settings);
     Ok(())
 }
 
@@ -1725,7 +1821,7 @@ fn adjust_code_zoom(
     zoom_in: bool,
     scroll_key: Option<(egui::Id, bool, bool)>,
 ) {
-    let old_zoom = viewer.code_zoom;
+    let old_zoom = viewer.settings.code_zoom;
     let new_zoom = if zoom_in {
         (old_zoom + 0.1).min(2.0)
     } else {
@@ -1738,7 +1834,7 @@ fn adjust_code_zoom(
     let old_offset = scroll_key
         .and_then(|key| viewer.scroll_offsets.get(&key).copied())
         .unwrap_or(0.0);
-    viewer.code_zoom = new_zoom;
+    viewer.settings.code_zoom = new_zoom;
     viewer.pending_scroll = scroll_key.map(|key| {
         (
             key,
@@ -1762,7 +1858,11 @@ fn render_code_rows(
     horizontal_offset: f32,
     zoom: f32,
 ) {
-    ui.set_min_width(if split { width * 2.0 + 12.0 } else { width });
+    ui.set_min_width(if split {
+        width * 2.0 + SPLIT_COLUMN_GAP
+    } else {
+        width
+    });
     for row_index in range {
         let row = &rows[row_index];
         ui.push_id(row_index, |ui| {
@@ -1775,12 +1875,12 @@ fn render_code_rows(
                     .truncate(),
                 );
             } else if split {
-                let row_size = egui::vec2(width * 2.0 + 12.0, row_height);
+                let row_size = egui::vec2(width * 2.0 + SPLIT_COLUMN_GAP, row_height);
                 let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
                 let left_rect =
                     egui::Rect::from_min_size(row_rect.min, egui::vec2(width, row_height));
                 let right_rect = egui::Rect::from_min_size(
-                    egui::pos2(row_rect.left() + width + 12.0, row_rect.top()),
+                    egui::pos2(row_rect.left() + width + SPLIT_COLUMN_GAP, row_rect.top()),
                     egui::vec2(width, row_height),
                 );
                 cell(
@@ -1957,7 +2057,11 @@ fn cell(
     } else {
         egui::Color32::from_gray(120)
     };
-    let gutter_width = (if inline { 120.0 } else { 70.0 }) * zoom;
+    let gutter_width = if inline {
+        120.0 * zoom
+    } else {
+        (70.0 * zoom).min(rect.width() * 0.6)
+    };
     let center = rect.center().y;
     if inline {
         ui.painter().text(
@@ -1984,14 +2088,14 @@ fn cell(
     } else {
         let line_number = if right { row.new } else { row.old };
         ui.painter().text(
-            egui::pos2(rect.left() + 48.0 * zoom, center),
+            egui::pos2(rect.left() + (48.0 / 70.0) * gutter_width, center),
             egui::Align2::RIGHT_CENTER,
             line_number.map_or_else(String::new, |n| n.to_string()),
             font.clone(),
             color,
         );
         ui.painter().text(
-            egui::pos2(rect.left() + 56.0 * zoom, center),
+            egui::pos2(rect.left() + (56.0 / 70.0) * gutter_width, center),
             egui::Align2::LEFT_CENTER,
             prefix,
             font.clone(),
@@ -2166,10 +2270,13 @@ mod selection_tests {
 
     #[test]
     fn enter_opens_the_project_from_the_menu() {
-        let mut viewer = Viewer::start(cli::Options {
-            repo: "/nonexistent-differ-test-repository".into(),
-            target: git::Target::Worktree,
-        });
+        let mut viewer = Viewer::start(
+            cli::Options {
+                repo: Some("/nonexistent-differ-test-repository".into()),
+                target: git::Target::Worktree,
+            },
+            Settings::default(),
+        );
         let (requests, received) = mpsc::channel();
         viewer.requests = requests;
         viewer.repo_input = "/other-differ-test-repository".into();
@@ -2250,10 +2357,13 @@ mod selection_tests {
 
     #[test]
     fn staging_is_single_flight_and_stale_completion_does_not_reload() {
-        let mut viewer = Viewer::start(cli::Options {
-            repo: std::path::PathBuf::from("/nonexistent-differ-test-repository"),
-            target: git::Target::Worktree,
-        });
+        let mut viewer = Viewer::start(
+            cli::Options {
+                repo: Some("/nonexistent-differ-test-repository".into()),
+                target: git::Target::Worktree,
+            },
+            Settings::default(),
+        );
         let (requests, received) = mpsc::channel();
         viewer.requests = requests;
         let file = git::ChangedFile {
@@ -2299,10 +2409,13 @@ mod selection_tests {
 
     #[test]
     fn changing_selection_discards_all_stale_results_and_resets_view() {
-        let mut viewer = Viewer::start(cli::Options {
-            repo: std::path::PathBuf::from("/nonexistent-differ-test-repository"),
-            target: git::Target::Worktree,
-        });
+        let mut viewer = Viewer::start(
+            cli::Options {
+                repo: Some("/nonexistent-differ-test-repository".into()),
+                target: git::Target::Worktree,
+            },
+            Settings::default(),
+        );
         viewer.selected = Some(7);
         viewer.cache.insert(7, Err("old file".into()));
         viewer
@@ -2397,10 +2510,13 @@ mod refresh_tests {
     }
 
     fn viewer(c: Arc<Comparison>) -> (Viewer, mpsc::Receiver<Request>) {
-        let mut viewer = Viewer::start(cli::Options {
-            repo: c.repo.clone(),
-            target: git::Target::Worktree,
-        });
+        let mut viewer = Viewer::start(
+            cli::Options {
+                repo: Some(c.repo.clone()),
+                target: git::Target::Worktree,
+            },
+            Settings::default(),
+        );
         let (tx, rx) = mpsc::channel();
         viewer.requests = tx;
         // Ignore initial worker messages: these tests drive events explicitly.
@@ -2410,6 +2526,40 @@ mod refresh_tests {
         viewer.comparison = Some(c);
         viewer.selected = Some(0);
         (viewer, rx)
+    }
+
+    #[test]
+    fn last_project_is_a_default_and_only_changes_after_a_successful_open() {
+        let first = Repo::new();
+        let second = Repo::new();
+        let last = git::normalize_repo(&first.0).unwrap();
+        let target = git::Target::Worktree;
+        assert_eq!(startup_repo(None, &target, Some(&last)), last);
+        assert_eq!(
+            startup_repo(Some(".".into()), &target, Some(&last)),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            startup_repo(None, &git::Target::Commit("HEAD".into()), Some(&last)),
+            PathBuf::from(".")
+        );
+        let missing = first.0.join("missing");
+        assert_eq!(
+            startup_repo(None, &target, Some(&missing)),
+            PathBuf::from(".")
+        );
+
+        let (mut viewer, _) = viewer(first.request(None).comparison);
+        viewer.settings.last_repo = Some(last.clone());
+        viewer.accept(Event::Comparison(
+            0,
+            target.clone(),
+            Err("not a repository".into()),
+        ));
+        assert_eq!(viewer.settings.last_repo.as_ref(), Some(&last));
+        let comparison = second.request(None).comparison;
+        viewer.accept(Event::Comparison(0, target, Ok(comparison.clone())));
+        assert_eq!(viewer.settings.last_repo.as_ref(), Some(&comparison.repo));
     }
 
     #[test]
