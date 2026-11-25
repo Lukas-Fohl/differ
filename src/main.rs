@@ -226,16 +226,26 @@ impl Tree {
         for (name, index) in &self.files {
             let file = &c.files[*index];
             let status = file.status.chars().next().unwrap_or('M');
-            let color = match status {
-                'A' => GREEN,
-                'D' => RED,
-                'R' => egui::Color32::from_rgb(140, 180, 245),
-                _ => egui::Color32::from_rgb(222, 189, 120),
-            };
-            let label =
-                egui::RichText::new(format!("{status}  {}", name.to_string_lossy())).color(color);
+            let mut label = egui::text::LayoutJob::default();
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            label.append(
+                &format!("{status}  "),
+                0.0,
+                egui::TextFormat::simple(
+                    font.clone(),
+                    status_color(status, ui.visuals().dark_mode),
+                ),
+            );
+            label.append(
+                &name.to_string_lossy(),
+                0.0,
+                egui::TextFormat::simple(font, ui.visuals().text_color()),
+            );
             let response = ui
-                .selectable_label(*selected == Some(*index), label)
+                .add(
+                    egui::Button::selectable(*selected == Some(*index), label)
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                )
                 .on_hover_text(file.path.to_string_lossy());
             if response.clicked() {
                 *selected = Some(*index);
@@ -453,8 +463,12 @@ impl Viewer {
         });
     }
 
+    fn staging_in_progress(&self) -> bool {
+        self.staging_pending || self.follow_file.is_some()
+    }
+
     fn toggle_staging(&mut self, indices: &[usize]) {
-        if self.staging_pending || self.refresh_error.is_some() {
+        if self.staging_in_progress() || self.refresh_error.is_some() {
             return;
         }
         let Some(comparison) = &self.comparison else {
@@ -527,7 +541,7 @@ impl Viewer {
             comparison,
             target: self.target.clone(),
             selected: self.selected_key(),
-            follow: self.follow_file.take(),
+            follow: self.follow_file.clone(),
             source: self.history_source.clone(),
             limit: self.history_limit,
             refs: self.refs.clone(),
@@ -535,6 +549,7 @@ impl Viewer {
         if self.requests.send(Request::Refresh(request)).is_ok() {
             self.refresh_pending = true;
         } else {
+            self.follow_file = None;
             self.refresh_error = Some("Repository worker is unavailable".into());
         }
     }
@@ -549,6 +564,7 @@ impl Viewer {
             return;
         }
         self.refresh_pending = false;
+        self.follow_file = None;
         self.next_refresh = Instant::now() + Duration::from_secs(1);
         if selected != self.selected_key() {
             return;
@@ -686,8 +702,92 @@ impl Viewer {
 
 const CODE_ROW_HEIGHT: f32 = 16.0;
 
-const GREEN: egui::Color32 = egui::Color32::from_rgb(135, 218, 165);
-const RED: egui::Color32 = egui::Color32::from_rgb(244, 150, 152);
+fn status_color(status: char, dark: bool) -> egui::Color32 {
+    let (r, g, b) = match (status, dark) {
+        ('A' | '?', true) => (135, 218, 165),
+        ('A' | '?', false) => (35, 105, 58),
+        ('D' | 'U', true) => (244, 150, 152),
+        ('D' | 'U', false) => (155, 45, 55),
+        ('R', true) => (140, 180, 245),
+        ('R', false) => (44, 89, 158),
+        (_, true) => (222, 189, 120),
+        (_, false) => (126, 86, 22),
+    };
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn viewer_visuals(light: bool) -> egui::Visuals {
+    use egui::Color32 as Color;
+    let (panel, canvas, edge, hover, pressed, ink, muted, selection, accent) = if light {
+        (
+            Color::from_rgb(240, 238, 242),
+            Color::from_rgb(252, 251, 253),
+            Color::from_rgb(219, 215, 223),
+            Color::from_rgb(230, 225, 235),
+            Color::from_rgb(222, 213, 235),
+            Color::from_rgb(40, 35, 46),
+            Color::from_rgb(104, 94, 113),
+            Color::from_rgb(233, 223, 249),
+            Color::from_rgb(112, 65, 174),
+        )
+    } else {
+        (
+            Color::from_rgb(30, 29, 33),
+            Color::from_rgb(36, 35, 39),
+            Color::from_rgb(56, 53, 61),
+            Color::from_rgb(46, 43, 51),
+            Color::from_rgb(61, 51, 74),
+            Color::from_rgb(230, 226, 234),
+            Color::from_rgb(167, 159, 176),
+            Color::from_rgb(60, 48, 77),
+            Color::from_rgb(188, 151, 252),
+        )
+    };
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    visuals.panel_fill = panel;
+    visuals.window_fill = panel;
+    visuals.extreme_bg_color = canvas;
+    visuals.faint_bg_color = canvas;
+    visuals.window_stroke = egui::Stroke::new(1.0, edge);
+    visuals.window_corner_radius = 6.into();
+    visuals.selection.bg_fill = selection;
+    visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+    visuals.hyperlink_color = accent;
+    visuals.error_fg_color = status_color('D', !light);
+    for (widget, fill, fg, border) in [
+        (&mut visuals.widgets.noninteractive, panel, ink, edge),
+        (&mut visuals.widgets.inactive, panel, ink, edge),
+        (&mut visuals.widgets.hovered, hover, ink, edge),
+        (&mut visuals.widgets.active, pressed, ink, accent),
+        (&mut visuals.widgets.open, hover, ink, accent),
+    ] {
+        widget.bg_fill = fill;
+        widget.weak_bg_fill = fill;
+        widget.bg_stroke = egui::Stroke::new(1.0, border);
+        widget.fg_stroke.color = fg;
+        widget.corner_radius = 5.into();
+        widget.expansion = 0.0;
+    }
+    visuals.widgets.inactive.weak_bg_fill = Color::TRANSPARENT;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.weak_text_color = Some(muted);
+    visuals
+}
+
+fn pane_frame(ctx: &egui::Context, outer_margin: egui::Margin) -> egui::Frame {
+    let style = ctx.style();
+    egui::Frame::new()
+        .fill(style.visuals.panel_fill)
+        .stroke(style.visuals.window_stroke)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .outer_margin(outer_margin)
+}
 
 fn main() {
     let options = match cli::parse(std::env::args_os().skip(1)) {
@@ -810,6 +910,328 @@ fn picker_height(ui: &egui::Ui, extra_rows: usize) -> f32 {
     ((8 + extra_rows) as f32 * row_height).max(ui.spacing().combo_height)
 }
 
+fn compact_label(text: &str, limit: usize) -> String {
+    if let Some((byte, _)) = text.char_indices().nth(limit) {
+        format!("{}…", &text[..byte])
+    } else {
+        text.to_owned()
+    }
+}
+
+fn project_menu(ui: &mut egui::Ui, viewer: &mut Viewer) {
+    let repo = viewer.comparison.as_ref().map_or(&viewer.repo, |c| &c.repo);
+    let name = repo
+        .file_name()
+        .unwrap_or(repo.as_os_str())
+        .to_string_lossy();
+    let button = ui
+        .button(format!("Project · {}", compact_label(&name, 16)))
+        .on_hover_text(repo.to_string_lossy());
+    egui::Popup::menu(&button)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let path_before_edit = viewer.repo_input.clone();
+            let path_response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut viewer.repo_input)
+                        .id(egui::Id::new("project_path"))
+                        .desired_width(250.0)
+                        .hint_text("path relative to $HOME or absolute"),
+                )
+                .on_hover_text("Edit a path relative to $HOME or enter an absolute path");
+            if path_response.has_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Backspace))
+                && viewer.repo_input == path_before_edit
+            {
+                let range =
+                    egui::widgets::text_edit::TextEditState::load(ui.ctx(), path_response.id)
+                        .and_then(|state| state.cursor.char_range());
+                delete_text_before_cursor(&mut viewer.repo_input, range);
+            }
+            ui.horizontal(|ui| {
+                let mut selected_folder = None;
+                if ui.button("Browse…").clicked() {
+                    let directory =
+                        project_path_from_input(std::path::Path::new(viewer.repo_input.trim()));
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Select project folder")
+                        .set_directory(directory)
+                        .pick_folder()
+                    {
+                        viewer.repo_input = project_path_for_input(&path);
+                        selected_folder = Some(path);
+                    }
+                }
+                let open_clicked = ui
+                    .add_enabled(
+                        !viewer.repo_input.trim().is_empty(),
+                        egui::Button::new("Open"),
+                    )
+                    .on_hover_text("Open this repository")
+                    .clicked();
+                let enter_pressed = (path_response.lost_focus() || path_response.has_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let repo_to_open = selected_folder.or_else(|| {
+                    (!viewer.repo_input.trim().is_empty() && (open_clicked || enter_pressed)).then(
+                        || project_path_from_input(std::path::Path::new(viewer.repo_input.trim())),
+                    )
+                });
+                if let Some(repo) = repo_to_open {
+                    viewer.branch_filter.clear();
+                    viewer.commit_filter.clear();
+                    viewer.repo = repo;
+                    viewer.target = git::Target::Worktree;
+                    viewer.history_source = None;
+                    viewer.history = None;
+                    viewer.history_limit = 100;
+                    viewer.reload(None, false);
+                    ui.close();
+                }
+            });
+            ui.separator();
+            if ui.button("Reload").clicked() {
+                if viewer.comparison.is_some() {
+                    viewer.refs = None;
+                    viewer.start_refresh(Instant::now());
+                } else {
+                    let source = viewer.history_source.clone();
+                    viewer.reload(source, false);
+                }
+                ui.close();
+            }
+        });
+}
+
+fn view_controls(ui: &mut egui::Ui, viewer: &mut Viewer) {
+    ui.horizontal_wrapped(|ui| {
+        ui.group(|ui| {
+            ui.selectable_value(&mut viewer.split, false, "Inline");
+            ui.selectable_value(&mut viewer.split, true, "Side by side");
+        });
+        ui.group(|ui| {
+            ui.selectable_value(&mut viewer.full, false, "Changes");
+            ui.selectable_value(&mut viewer.full, true, "Full file");
+        });
+    });
+}
+
+fn workspace_footer(ui: &mut egui::Ui, viewer: &mut Viewer) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak("Code zoom");
+        let scroll_key = viewer.selected.and_then(|index| {
+            viewer
+                .comparison
+                .as_ref()
+                .map(|c| (file_id(c, index), viewer.split, viewer.full))
+        });
+        if ui
+            .add_enabled(viewer.code_zoom > 0.5, egui::Button::new("−"))
+            .on_hover_text("Zoom out (Ctrl+-)")
+            .clicked()
+        {
+            adjust_code_zoom(viewer, false, scroll_key);
+        }
+        ui.label(format!("{:.0}%", viewer.code_zoom * 100.0));
+        if ui
+            .add_enabled(viewer.code_zoom < 2.0, egui::Button::new("+"))
+            .on_hover_text("Zoom in (Ctrl++)")
+            .clicked()
+        {
+            adjust_code_zoom(viewer, true, scroll_key);
+        }
+        ui.separator();
+        let theme = if viewer.light_mode {
+            "Dark theme"
+        } else {
+            "Light theme"
+        };
+        if ui.button(theme).clicked() {
+            viewer.light_mode = !viewer.light_mode;
+            ui.ctx().request_repaint();
+        }
+    });
+}
+
+fn toolbar_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: impl Into<egui::WidgetText>,
+    extra_rows: usize,
+    contents: impl FnOnce(&mut egui::Ui, bool),
+) -> egui::Response {
+    // Reserve the whole control before it measures its text so it wraps as a unit.
+    let width = 132.0_f32.min(ui.max_rect().width());
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id(id));
+            egui::ComboBox::from_id_salt(id)
+                .width(width)
+                .truncate()
+                .selected_text(label)
+                .height(picker_height(ui, extra_rows))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| contents(ui, was_open))
+                .response
+        },
+    )
+    .inner
+}
+
+fn toolbar(ui: &mut egui::Ui, viewer: &mut Viewer) {
+    let mut branch_choice = None;
+    let mut target_choice = None;
+    let mut load_more = false;
+    let mut branch_filter = std::mem::take(&mut viewer.branch_filter);
+    let mut commit_filter = std::mem::take(&mut viewer.commit_filter);
+    ui.horizontal_wrapped(|ui| {
+        project_menu(ui, viewer);
+        if let Some(history) = &viewer.history {
+            let branch_label = if history.source == "HEAD" {
+                history
+                    .branches
+                    .current
+                    .as_deref()
+                    .unwrap_or("Detached HEAD")
+            } else {
+                history
+                    .source
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&history.source)
+            };
+            toolbar_picker(
+                ui,
+                "branch_selector",
+                format!("Branch · {}", compact_label(branch_label, 15)),
+                0,
+                |ui, was_open| {
+                    picker_filter(ui, &mut branch_filter, "Filter branches…", !was_open);
+                    let query = view::fold_filter_text(&branch_filter);
+                    let mut matches = 0;
+                    for branch in &history.branches.local {
+                        if !view::filter_matches(&query, &[branch]) {
+                            continue;
+                        }
+                        matches += 1;
+                        let source = format!("refs/heads/{branch}");
+                        if ui
+                            .selectable_label(history.source == source, branch)
+                            .clicked()
+                        {
+                            branch_choice = Some(source);
+                            ui.close();
+                        }
+                    }
+                    if matches == 0 {
+                        ui.weak("No matching branches");
+                    }
+                },
+            )
+            .on_hover_text(if history.source == "HEAD" {
+                branch_label
+            } else {
+                &history.source
+            });
+
+            let (selected_label, revision_hint) = match &viewer.target {
+                git::Target::Worktree => (
+                    "Working tree".into(),
+                    "Working-tree changes (current checkout)".into(),
+                ),
+                git::Target::Branch(name) => (
+                    format!("HEAD → {}", compact_label(name, 14)),
+                    format!("HEAD → {name}"),
+                ),
+                git::Target::Commit(id) => history
+                    .commits
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| {
+                        (
+                            format!("Commit {}", c.short_id),
+                            format!("{id} — {}", c.subject),
+                        )
+                    })
+                    .unwrap_or_else(|| (format!("Commit {}", compact_label(id, 8)), id.clone())),
+            };
+            toolbar_picker(ui, "commit_selector", selected_label, 3, |ui, was_open| {
+                picker_filter(ui, &mut commit_filter, "Filter commits…", !was_open);
+                if ui
+                    .selectable_label(
+                        matches!(viewer.target, git::Target::Worktree),
+                        "Working tree",
+                    )
+                    .clicked()
+                {
+                    target_choice = Some(git::Target::Worktree);
+                    ui.close();
+                }
+                let query = view::fold_filter_text(&commit_filter);
+                let mut matches = 0;
+                for commit in &history.commits {
+                    if !view::filter_matches(
+                        &query,
+                        &[&commit.id, &commit.short_id, &commit.subject],
+                    ) {
+                        continue;
+                    }
+                    matches += 1;
+                    let selected =
+                        matches!(&viewer.target, git::Target::Commit(id) if id == &commit.id);
+                    if ui
+                        .selectable_label(
+                            selected,
+                            format!("{} — {}", commit.short_id, commit.subject),
+                        )
+                        .clicked()
+                    {
+                        target_choice = Some(git::Target::Commit(commit.id.clone()));
+                        ui.close();
+                    }
+                }
+                if history.commits.is_empty() {
+                    ui.weak("No commits yet");
+                } else if matches == 0 {
+                    ui.weak("No matching loaded commits");
+                }
+                if history.has_more
+                    && ui
+                        .add_enabled(!viewer.loading, egui::Button::new("Load more…"))
+                        .clicked()
+                {
+                    load_more = true;
+                    ui.close();
+                }
+            })
+            .on_hover_ui(|ui| {
+                ui.label(revision_hint);
+                if let Some(c) = viewer.comparison.as_ref().filter(|c| !c.working_tree) {
+                    ui.weak(&c.label);
+                }
+            });
+        }
+    });
+    if let Some(error) = &viewer.history_error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    viewer.branch_filter = branch_filter;
+    viewer.commit_filter = commit_filter;
+    if let Some(source) = branch_choice {
+        viewer.history_source = Some(source.clone());
+        viewer.history_limit = 100;
+        viewer.reload(Some(source), true);
+    } else if let Some(target) = target_choice {
+        viewer.target = target;
+        let source = viewer.history_source.clone();
+        viewer.reload(source, false);
+    } else if load_more {
+        viewer.history_limit += 100;
+        let source = viewer.history_source.clone();
+        viewer.reload(source, false);
+    }
+}
+
 fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     let ctx = contexts.ctx_mut()?;
     viewer.poll();
@@ -849,11 +1271,15 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         });
         adjust_code_zoom(&mut viewer, zoom_in, scroll_key);
     }
-    ctx.set_visuals(if viewer.light_mode {
-        egui::Visuals::light()
+    ctx.set_visuals(viewer_visuals(viewer.light_mode));
+    let backdrop = if viewer.light_mode {
+        egui::Color32::from_rgb(232, 229, 235)
     } else {
-        egui::Visuals::dark()
-    });
+        egui::Color32::from_rgb(22, 21, 25)
+    };
+    ctx.layer_painter(egui::LayerId::background())
+        .rect_filled(ctx.content_rect(), 0, backdrop);
+    let error_color = status_color('D', !viewer.light_mode);
     if viewer.staging_pending
         || viewer.refresh_pending
         || viewer.loading
@@ -864,227 +1290,37 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
-    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            let scroll_key = viewer
-                .selected
-                .and_then(|index| viewer.comparison.as_ref().map(|c| (file_id(c, index), viewer.split, viewer.full)));
-            ui.strong("DIFF");
-            ui.separator();
-            ui.selectable_value(&mut viewer.split, false, "Inline");
-            ui.selectable_value(&mut viewer.split, true, "Side by side");
-            ui.separator();
-            ui.selectable_value(&mut viewer.full, false, "Changes");
-            ui.selectable_value(&mut viewer.full, true, "Full file");
-            ui.separator();
-            let theme_label = if viewer.light_mode {
-                "☾ Dark"
-            } else {
-                "☀ Light"
-            };
-            if ui
-                .button(theme_label)
-                .on_hover_text("Switch between light and dark themes")
-                .clicked()
-            {
-                viewer.light_mode = !viewer.light_mode;
-            }
-            ui.separator();
-            if ui
-                .button("⟳ Reload")
-                .on_hover_text("Reload changes from the repository")
-                .clicked()
-            {
-                if viewer.comparison.is_some() {
-                    viewer.refs = None;
-                    viewer.start_refresh(Instant::now());
-                } else {
-                    let source = viewer.history_source.clone();
-                    viewer.reload(source, false);
-                }
-            }
-            ui.separator();
-            if ui
-                .add_enabled(viewer.code_zoom > 0.5, egui::Button::new("A−"))
-                .on_hover_text("Zoom code out (Ctrl+-)")
-                .clicked()
-            {
-                adjust_code_zoom(&mut viewer, false, scroll_key);
-            }
-            ui.label(format!("{:.0}%", viewer.code_zoom * 100.0));
-            if ui
-                .add_enabled(viewer.code_zoom < 2.0, egui::Button::new("A+"))
-                .on_hover_text("Zoom code in (Ctrl++)")
-                .clicked()
-            {
-                adjust_code_zoom(&mut viewer, true, scroll_key);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Project");
-            let path_before_edit = viewer.repo_input.clone();
-            let path_response = ui
-                .add(
-                    egui::TextEdit::singleline(&mut viewer.repo_input)
-                        .id(egui::Id::new("project_path"))
-                        .desired_width(300.0)
-                        .hint_text("path relative to $HOME or absolute"),
-                )
-                .on_hover_text("Edit a path relative to $HOME or enter an absolute path");
-            if path_response.has_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Backspace))
-                && viewer.repo_input == path_before_edit
-            {
-                let range = egui::widgets::text_edit::TextEditState::load(ctx, path_response.id)
-                    .and_then(|state| state.cursor.char_range());
-                delete_text_before_cursor(&mut viewer.repo_input, range);
-            }
-            let mut selected_folder = None;
-            if ui.button("Browse…").clicked() {
-                let directory =
-                    project_path_from_input(std::path::Path::new(viewer.repo_input.trim()));
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Select project folder")
-                    .set_directory(directory)
-                    .pick_folder()
-                {
-                    viewer.repo_input = project_path_for_input(&path);
-                    selected_folder = Some(path);
-                }
-            }
-            let open_clicked = ui
-                .add_enabled(
-                    !viewer.repo_input.trim().is_empty(),
-                    egui::Button::new("Open"),
-                )
-                .on_hover_text("Open this repository")
-                .clicked();
-            let enter_pressed =
-                path_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            let repo_to_open = selected_folder.or_else(|| {
-                (!viewer.repo_input.trim().is_empty() && (open_clicked || enter_pressed)).then(
-                    || project_path_from_input(std::path::Path::new(viewer.repo_input.trim())),
-                )
-            });
-            if let Some(repo) = repo_to_open {
-                viewer.branch_filter.clear();
-                viewer.commit_filter.clear();
-                viewer.repo = repo;
-                viewer.target = git::Target::Worktree;
-                viewer.history_source = None;
-                viewer.history = None;
-                viewer.history_limit = 100;
-                viewer.reload(None, false);
-            }
-        });
-        let mut branch_choice = None;
-        let mut target_choice = None;
-        let mut load_more = false;
-        let mut branch_filter = std::mem::take(&mut viewer.branch_filter);
-        let mut commit_filter = std::mem::take(&mut viewer.commit_filter);
-        ui.horizontal_wrapped(|ui| {
-            if let Some(history) = &viewer.history {
-                ui.label("Branch");
-                let branch_label = history.source.strip_prefix("refs/heads/").unwrap_or(&history.source);
-                let branch_label = if history.source == "HEAD" {
-                    history.branches.current.as_deref().unwrap_or("Detached HEAD")
-                } else { branch_label };
-                let branch_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("branch_selector"));
-                egui::ComboBox::from_id_salt("branch_selector").selected_text(branch_label)
-                    .height(picker_height(ui, 0))
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show_ui(ui, |ui| {
-                        picker_filter(ui, &mut branch_filter, "Filter branches…", !branch_was_open);
-                        let query = view::fold_filter_text(&branch_filter);
-                        let mut matches = 0;
-                        for branch in &history.branches.local {
-                            if !view::filter_matches(&query, &[branch]) { continue; }
-                            matches += 1;
-                            let source = format!("refs/heads/{branch}");
-                            if ui.selectable_label(history.source == source, branch).clicked() {
-                                branch_choice = Some(source);
-                                ui.close();
-                            }
-                        }
-                        if matches == 0 { ui.weak("No matching branches"); }
-                    });
-                ui.label("Commit");
-                let selected_label = match &viewer.target {
-                    git::Target::Worktree => "Working-tree changes (current checkout)".to_owned(),
-                    git::Target::Branch(name) => format!("HEAD → {name}"),
-                    git::Target::Commit(id) => history.commits.iter().find(|c| &c.id == id)
-                        .map(|c| format!("{} — {}", c.short_id, c.subject))
-                        .unwrap_or_else(|| format!("Commit {id}")),
-                };
-                let commit_was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id("commit_selector"));
-                egui::ComboBox::from_id_salt("commit_selector").width(350.0)
-                    .height(picker_height(ui, 3))
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .selected_text(selected_label).show_ui(ui, |ui| {
-                        picker_filter(ui, &mut commit_filter, "Filter commits…", !commit_was_open);
-                        ui.weak(format!("Filtering {} loaded commits", history.commits.len()));
-                        if ui.selectable_label(matches!(viewer.target, git::Target::Worktree),
-                            "Working-tree changes (current checkout)").clicked() {
-                            target_choice = Some(git::Target::Worktree);
-                            ui.close();
-                        }
-                        let query = view::fold_filter_text(&commit_filter);
-                        let mut matches = 0;
-                        for commit in &history.commits {
-                            if !view::filter_matches(&query, &[&commit.id, &commit.short_id, &commit.subject]) { continue; }
-                            matches += 1;
-                            if ui.selectable_label(matches!(&viewer.target, git::Target::Commit(id) if id == &commit.id),
-                                format!("{} — {}", commit.short_id, commit.subject)).clicked() {
-                                target_choice = Some(git::Target::Commit(commit.id.clone()));
-                                ui.close();
-                            }
-                        }
-                        if history.commits.is_empty() { ui.label("No commits yet"); }
-                        else if matches == 0 { ui.weak("No matching loaded commits"); }
-                        if history.has_more && ui.add_enabled(!viewer.loading, egui::Button::new("Load more…")).clicked() {
-                            load_more = true;
-                            ui.close();
-                        }
-                    });
-            }
-            if viewer.loading { ui.spinner(); ui.label("Loading…"); }
-            if let Some(error) = &viewer.refresh_error { ui.colored_label(RED, format!("Auto-refresh failed: {error}")); }
-            if let Some(error) = &viewer.history_error { ui.colored_label(RED, error); }
-        });
-        viewer.branch_filter = branch_filter;
-        viewer.commit_filter = commit_filter;
-        if let Some(source) = branch_choice {
-            viewer.history_source = Some(source.clone());
-            viewer.history_limit = 100;
-            viewer.reload(Some(source), true);
-        } else if let Some(target) = target_choice {
-            viewer.target = target;
-            let source = viewer.history_source.clone();
-            viewer.reload(source, false);
-        } else if load_more {
-            viewer.history_limit += 100;
-            let source = viewer.history_source.clone();
-            viewer.reload(source, false);
-        }
-        if let Some(c) = viewer.comparison.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(c.repo.to_string_lossy()).weak());
-                ui.separator();
-                ui.label(&c.label);
-            });
-        }
-        ui.add_space(4.0);
-    });
+    let left_gutter = if viewer.comparison.is_some() { 4 } else { 8 };
     if let Some(c) = viewer.comparison.clone() {
         egui::SidePanel::left("files")
-            .default_width(260.0)
+            .show_separator_line(false)
+            .frame(pane_frame(
+                ctx,
+                egui::Margin {
+                    left: 8,
+                    right: 4,
+                    top: 8,
+                    bottom: 8,
+                },
+            ))
+            .default_width(244.0)
             .width_range(140.0..=600.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.strong(format!("Changed files  ·  {}", c.files.len()));
-                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CHANGES").small().strong().weak());
+                    ui.weak(c.files.len().to_string());
+                    if viewer.staging_in_progress() {
+                        ui.spinner().on_hover_text("Updating staging area…");
+                    }
+                });
+                ui.add_space(8.0);
+                if let Some(error) = &viewer.refresh_error {
+                    ui.colored_label(error_color, format!("Auto-refresh failed: {error}"));
+                }
+                if let Some(error) = &viewer.staging_error {
+                    ui.colored_label(error_color, error);
+                }
                 let mut selected = viewer.selected;
                 let mut action = None;
                 egui::ScrollArea::both().show(ui, |ui| {
@@ -1109,11 +1345,9 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                                         &c,
                                         &mut selected,
                                         &mut action,
-                                        viewer.staging_pending || viewer.refresh_error.is_some(),
+                                        viewer.staging_in_progress()
+                                            || viewer.refresh_error.is_some(),
                                     );
-                                    if count == 0 {
-                                        ui.weak("No files");
-                                    }
                                 });
                             });
                         }
@@ -1124,23 +1358,54 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
                 if let Some(index) = action {
                     viewer.toggle_staging(&index);
                 }
-                if viewer.staging_pending {
-                    ui.spinner();
-                    ui.label("Updating staging area…");
-                }
-                if let Some(error) = &viewer.staging_error {
-                    ui.colored_label(RED, error);
-                }
                 if viewer.selected != selected {
                     ctx.request_repaint();
                 }
                 viewer.selected = selected;
             });
     }
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::TopBottomPanel::top("toolbar")
+        .show_separator_line(false)
+        .frame(pane_frame(
+            ctx,
+            egui::Margin {
+                left: left_gutter,
+                right: 8,
+                top: 8,
+                bottom: 4,
+            },
+        ))
+        .show(ctx, |ui| toolbar(ui, &mut viewer));
+    egui::TopBottomPanel::bottom("workspace_footer")
+        .show_separator_line(false)
+        .frame(
+            pane_frame(
+                ctx,
+                egui::Margin {
+                    left: left_gutter,
+                    right: 8,
+                    top: 4,
+                    bottom: 8,
+                },
+            )
+            .inner_margin(egui::Margin::symmetric(12, 4)),
+        )
+        .show(ctx, |ui| workspace_footer(ui, &mut viewer));
+    let frame = pane_frame(
+        ctx,
+        egui::Margin {
+            left: left_gutter,
+            right: 8,
+            top: 4,
+            bottom: 4,
+        },
+    )
+    .inner_margin(egui::Margin::symmetric(14, 10))
+    .fill(ctx.style().visuals.extreme_bg_color);
+    egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         if let Some(error) = &viewer.error {
             ui.heading("Could not open comparison");
-            ui.colored_label(RED, error);
+            ui.colored_label(error_color, error);
             return;
         }
         let Some(c) = viewer.comparison.clone() else {
@@ -1162,19 +1427,123 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
             return;
         };
         let file = &c.files[index];
-        ui.heading(file.path.to_string_lossy());
+        let result = viewer.cache.get(&index).cloned();
+        let full_path = file.path.to_string_lossy();
+        let name = file
+            .path
+            .file_name()
+            .unwrap_or(file.path.as_os_str())
+            .to_string_lossy();
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 30.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if c.working_tree {
+                    let unavailable = if file.status == "U" {
+                        Some("Resolve merge conflicts first")
+                    } else if viewer.staging_in_progress() {
+                        Some("Updating staging area…")
+                    } else if viewer.refresh_error.is_some() {
+                        Some("Reload the repository before staging")
+                    } else {
+                        None
+                    };
+                    let label = if file.staged {
+                        "Unstage file"
+                    } else {
+                        "Stage file"
+                    };
+                    let button = ui.add_enabled(
+                        unavailable.is_none(),
+                        egui::Button::new(label).fill(ui.visuals().selection.bg_fill),
+                    );
+                    if button
+                        .on_disabled_hover_text(unavailable.unwrap_or_default())
+                        .clicked()
+                    {
+                        viewer.toggle_staging(&[index]);
+                    }
+                }
+                ui.menu_button("Copy", |ui| {
+                    if ui
+                        .button("Copy path")
+                        .on_hover_text("Ctrl+Shift+C")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(full_path.to_string());
+                        ui.close();
+                    }
+                    let prepared = result
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .filter(|prepared| !prepared.diff.rows.is_empty());
+                    for (label, right) in [("Copy old file", false), ("Copy new file", true)] {
+                        let button = ui.add_enabled(prepared.is_some(), egui::Button::new(label));
+                        if let Some(prepared) = prepared.filter(|_| button.clicked()) {
+                            ui.ctx()
+                                .copy_text(view::file_text(&prepared.diff.rows, right));
+                            ui.close();
+                        }
+                    }
+                });
+                let tab_width = ui.available_width().clamp(0.0, 360.0);
+                let background = ui.visuals().widgets.hovered.bg_fill;
+                let accent = ui.visuals().selection.stroke.color;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let tab = egui::Frame::new()
+                            .fill(background)
+                            .corner_radius(5)
+                            .inner_margin(egui::Margin::symmetric(10, 5))
+                            .show(ui, |ui| {
+                                ui.set_max_width((tab_width - 20.0).max(0.0));
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(name.as_ref()).strong())
+                                        .truncate(),
+                                )
+                            })
+                            .response;
+                        ui.painter().line_segment(
+                            [
+                                tab.rect.left_bottom() + egui::vec2(6.0, 0.0),
+                                tab.rect.right_bottom() - egui::vec2(6.0, 0.0),
+                            ],
+                            egui::Stroke::new(2.0, accent),
+                        );
+                        tab.on_hover_text(full_path.as_ref());
+                    },
+                );
+            },
+        );
+        ui.add_space(4.0);
+        if let Some(parent) = file.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            ui.add(
+                egui::Label::new(egui::RichText::new(parent.to_string_lossy()).small().weak())
+                    .truncate(),
+            )
+            .on_hover_text(full_path.as_ref());
+        }
         if c.working_tree {
-            ui.weak(if file.staged {
-                "Staged · HEAD → index"
+            ui.label(
+                egui::RichText::new(if file.staged { "Staged" } else { "Unstaged" })
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(if file.staged {
+                "HEAD to index"
             } else {
-                "Unstaged · index → working tree"
+                "Index to working tree"
             });
         }
         if file.path != file.old_path {
             ui.label(format!("Renamed from {}", file.old_path.display()));
         }
+        ui.add_space(4.0);
+        view_controls(ui, &mut viewer);
         ui.separator();
-        let Some(result) = viewer.cache.get(&index).cloned() else {
+        let Some(result) = result else {
             ui.spinner();
             ui.label("Loading diff…");
             return;
@@ -1182,7 +1551,7 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         let prepared = match result {
             Ok(p) => p,
             Err(error) => {
-                ui.colored_label(RED, error);
+                ui.colored_label(error_color, error);
                 return;
             }
         };
@@ -1192,23 +1561,6 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         if prepared.diff.rows.is_empty() {
             return;
         }
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("− removed").color(RED));
-            ui.label(egui::RichText::new("+ added").color(GREEN));
-            ui.separator();
-            if ui.small_button("Copy path (Ctrl+Shift+C)").clicked() {
-                ui.ctx().copy_text(file.path.to_string_lossy().into_owned());
-            }
-            ui.separator();
-            if ui.small_button("Copy old file").clicked() {
-                ui.ctx()
-                    .copy_text(view::file_text(&prepared.diff.rows, false));
-            }
-            if ui.small_button("Copy new file").clicked() {
-                ui.ctx()
-                    .copy_text(view::file_text(&prepared.diff.rows, true));
-            }
-        });
         let split = viewer.split;
         let rows = &prepared.layouts[usize::from(split) + 2 * usize::from(viewer.full)];
         let zoom = viewer.code_zoom;
@@ -1223,25 +1575,20 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
         } else {
             content_width.max(viewport_width)
         };
-        let mut horizontal_offset = 0.0;
-        if split {
+        let horizontal_offset = if split {
             ui.columns(2, |cols| {
-                cols[0].label("OLD");
-                cols[1].label("NEW");
+                cols[0].weak("Old");
+                cols[1].weak("New");
             });
-            // Keep both columns visible; one horizontal scrollbar moves their code together.
-            if content_width > width {
-                horizontal_offset = egui::ScrollArea::horizontal()
-                    .id_salt((file_id(&c, index), "code-horizontal"))
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.allocate_space(egui::vec2(viewport_width + content_width - width, 2.0));
-                    })
-                    .state
-                    .offset
-                    .x;
-            }
-        }
+            split_horizontal_scroll(
+                ui,
+                file_id(&c, index),
+                viewport_width,
+                (content_width - width).max(0.0),
+            )
+        } else {
+            0.0
+        };
         let scroll = if split {
             egui::ScrollArea::vertical()
         } else {
@@ -1331,6 +1678,46 @@ fn draw(mut contexts: EguiContexts, mut viewer: NonSendMut<Viewer>) -> Result {
     });
     viewer.pending_scroll = None;
     Ok(())
+}
+
+fn split_horizontal_scroll(
+    ui: &mut egui::Ui,
+    file: egui::Id,
+    viewport_width: f32,
+    max_offset: f32,
+) -> f32 {
+    if max_offset == 0.0 {
+        return 0.0;
+    }
+
+    let salt = (file, "code-horizontal");
+    let mut scroll = egui::ScrollArea::horizontal()
+        .id_salt(salt)
+        .max_width(viewport_width)
+        .auto_shrink([false, true]);
+
+    // Both code columns are fixed in place. Route horizontal gestures over the
+    // diff to their shared scrollbar and leave vertical input for the rows.
+    let mut diff_rect = ui.available_rect_before_wrap();
+    diff_rect.set_width(viewport_width);
+    if ui.rect_contains_pointer(diff_rect) && ui.ctx().dragged_id().is_none() {
+        let delta = ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.x));
+        if delta != 0.0 {
+            let id = ui.make_persistent_id(egui::Id::new(salt));
+            let state = egui::scroll_area::State::load(ui.ctx(), id).unwrap_or_default();
+            let offset = (state.offset.x - delta).clamp(0.0, max_offset);
+            scroll = scroll.horizontal_scroll_offset(offset);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    scroll
+        .show(ui, |ui| {
+            ui.allocate_space(egui::vec2(viewport_width + max_offset, 2.0));
+        })
+        .state
+        .offset
+        .x
 }
 
 fn adjust_code_zoom(
@@ -1459,7 +1846,7 @@ fn paint_change_overview(
                     egui::vec2(half, mark_height),
                 ),
                 0.0,
-                RED,
+                status_color('D', ui.visuals().dark_mode),
             );
             painter.rect_filled(
                 egui::Rect::from_min_size(
@@ -1467,7 +1854,7 @@ fn paint_change_overview(
                     egui::vec2(rect.width() - half, mark_height),
                 ),
                 0.0,
-                GREEN,
+                status_color('A', ui.visuals().dark_mode),
             );
         } else {
             painter.rect_filled(
@@ -1476,7 +1863,7 @@ fn paint_change_overview(
                     egui::vec2(rect.width(), mark_height),
                 ),
                 0.0,
-                if removed { RED } else { GREEN },
+                status_color(if removed { 'D' } else { 'A' }, ui.visuals().dark_mode),
             );
         }
     }
@@ -1520,16 +1907,24 @@ fn cell(
     let row = &diff.rows[index];
     let dark_mode = ui.visuals().dark_mode;
     let (background, foreground, prefix) = match row.kind {
-        LineKind::Added if dark_mode => (egui::Color32::from_rgb(27, 57, 42), GREEN, "+"),
-        LineKind::Added => (
-            egui::Color32::from_rgb(222, 247, 229),
-            egui::Color32::from_rgb(35, 105, 58),
+        LineKind::Added if dark_mode => (
+            egui::Color32::from_rgb(27, 57, 42),
+            status_color('A', true),
             "+",
         ),
-        LineKind::Removed if dark_mode => (egui::Color32::from_rgb(65, 33, 39), RED, "−"),
+        LineKind::Added => (
+            egui::Color32::from_rgb(222, 247, 229),
+            status_color('A', false),
+            "+",
+        ),
+        LineKind::Removed if dark_mode => (
+            egui::Color32::from_rgb(65, 33, 39),
+            status_color('D', true),
+            "−",
+        ),
         LineKind::Removed => (
             egui::Color32::from_rgb(252, 226, 228),
-            egui::Color32::from_rgb(155, 45, 55),
+            status_color('D', false),
             "−",
         ),
         LineKind::Note => (
@@ -1584,7 +1979,7 @@ fn cell(
             egui::Align2::LEFT_CENTER,
             prefix,
             font.clone(),
-            color,
+            foreground,
         );
     } else {
         let line_number = if right { row.new } else { row.old };
@@ -1600,7 +1995,7 @@ fn cell(
             egui::Align2::LEFT_CENTER,
             prefix,
             font.clone(),
-            color,
+            foreground,
         );
     }
     let text_rect = egui::Rect::from_min_max(rect.min + egui::vec2(gutter_width, 0.0), rect.max);
@@ -1626,6 +2021,45 @@ fn cell(
 #[cfg(test)]
 mod zoom_tests {
     use super::{egui, preserve_scroll_anchor, restore_code_scroll};
+
+    #[test]
+    fn scrolling_over_either_split_column_updates_one_horizontal_offset() {
+        let ctx = egui::Context::default();
+        let file = egui::Id::new("file");
+        let mut offset = 0.0;
+        for (x, delta, modifiers, expected) in [
+            (75.0, egui::vec2(-5.0, -3.0), egui::Modifiers::NONE, 5.0),
+            (275.0, egui::vec2(0.0, -4.0), egui::Modifiers::SHIFT, 9.0),
+            (375.0, egui::vec2(-5.0, 0.0), egui::Modifiers::NONE, 9.0),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(egui::pos2(x, 150.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta,
+                            modifiers,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        offset = super::split_horizontal_scroll(ui, file, 350.0, 200.0);
+                        if modifiers == egui::Modifiers::NONE {
+                            assert_eq!(ui.input(|i| i.smooth_scroll_delta.y), delta.y);
+                        }
+                    });
+                },
+            );
+            assert_eq!(offset, expected);
+        }
+    }
 
     #[test]
     fn zoom_keeps_the_same_row_and_fraction_at_the_top() {
@@ -1703,6 +2137,83 @@ mod zoom_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn revision_picker_wraps_inside_a_narrow_workspace() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(275.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right_edge = ui.max_rect().right();
+                    ui.horizontal_wrapped(|ui| {
+                        let branch =
+                            toolbar_picker(ui, "branch", "A long branch name", 0, |_, _| {});
+                        let commit = toolbar_picker(ui, "commit", "Working tree", 0, |_, _| {});
+                        assert!(commit.rect.top() >= branch.rect.bottom());
+                        assert!(commit.rect.right() <= right_edge);
+                    });
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_project_from_the_menu() {
+        let mut viewer = Viewer::start(cli::Options {
+            repo: "/nonexistent-differ-test-repository".into(),
+            target: git::Target::Worktree,
+        });
+        let (requests, received) = mpsc::channel();
+        viewer.requests = requests;
+        viewer.repo_input = "/other-differ-test-repository".into();
+        let ctx = egui::Context::default();
+        let run = |viewer: &mut Viewer, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| project_menu(ui, viewer));
+                },
+            );
+        };
+        run(&mut viewer, vec![]);
+        let pos = egui::pos2(24.0, 16.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(
+            &mut viewer,
+            vec![egui::Event::PointerMoved(pos), click(true)],
+        );
+        run(&mut viewer, vec![click(false)]);
+        ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("project_path")));
+        run(
+            &mut viewer,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let Request::Reload { repo, .. } = received.try_recv().unwrap() else {
+            panic!("Enter should open the entered repository");
+        };
+        assert_eq!(repo, std::path::Path::new("/other-differ-test-repository"));
+    }
 
     #[test]
     fn directory_indices_include_descendants_only() {
@@ -1944,8 +2455,11 @@ mod refresh_tests {
             let Request::Refresh(request) = requests.try_recv().unwrap() else {
                 panic!("expected background refresh");
             };
+            viewer.toggle_staging(&[index]);
+            assert!(requests.try_recv().is_err());
             let result = refresh(&request).unwrap();
             viewer.accept(Event::Refreshed(generation, request.selected, Ok(result)));
+            assert!(!viewer.staging_in_progress());
             assert_eq!(viewer.selected_key(), Some(("file".into(), staged)));
             let index = viewer.selected.unwrap();
             assert!(viewer.cache[&index].is_ok());
